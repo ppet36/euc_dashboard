@@ -7,5 +7,7 @@ In my EUC there is a 24s10p battery composed of Samsung INR21700-50E 4900mAh cel
 
 The dashboard is attached to the EUC frame with Velcro. It is only powered from the EUC and all communication is via bluetooth. It is connected to both EUC and BMS simultaneously and displays data from both boards.
 
+The video of the older version is on YouTube [Test of EUC dashboard](https://youtu.be/FmaS4RxT6nU). The latest version is not on the video. In the current version, it is also possible to modify some EUC parameters such as tiltback speed and pedal mode.
+
 
 
