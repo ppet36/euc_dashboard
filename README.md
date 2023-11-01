@@ -5,3 +5,7 @@ In my EUC there is a 24s10p battery composed of Samsung INR21700-50E 4900mAh cel
 
 ![alt](/images/dash.jpeg?raw=true)
 
+The dashboard is attached to the EUC frame with Velcro. It is only powered from the EUC and all communication is via bluetooth. It is connected to both EUC and BMS simultaneously and displays data from both boards.
+
+
+
