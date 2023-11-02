@@ -1,7 +1,7 @@
 /**
  * Dashboard pro my DIY EUC. For ESP32 a Nextion NX4024T032 display.
  * My EUC is based on Begode/Gotway Nikola board. Uses 24s/10p battery
- * managed by JK Smart BMS. Total capacity of battery is 5kWh.
+ * managed by JK Smart BMS BD6A24S10P. Total capacity of battery is 5kWh.
  *
  * Programmed from many sources I found on the internet.
  *
@@ -28,7 +28,7 @@
 #define NUM_CELLS 24
 
 // Some colors on Nextion display
-#define NEXTION_SILVER_COLOR 44405
+#define NEXTION_SILVER_COLOR 50712
 #define NEXTION_GREEN_COLOR  34784
 #define NEXTION_RED_COLOR    64171
 
@@ -105,10 +105,7 @@ struct WheelData {
   uint32_t mStartDistance;
 
   double mPhaseCurrent;
-
   int16_t mTemperature;
-
-  uint16_t mBattery;
   uint16_t mVoltage;
 
   uint8_t mLightMode;
@@ -126,6 +123,8 @@ struct BmsData {
   float mMaxCellVoltage;
   uint8_t mMinVoltageCell;
   uint8_t mMaxVoltageCell;
+  uint8_t mMinResistanceCell;
+  uint8_t mMaxResistanceCell;
   float mAvgCellVoltage;
   float mDeltaCellVoltage;
   float mTemperature1;
@@ -161,6 +160,11 @@ UnpackerData bmsUnpacker;
 String curDisplayLine = "";
 uint8_t curDisplayRow = 0;
 uint8_t displayedPage = 0;
+
+enum BatteryCellMode {
+  voltages,
+  resistances
+} batteryCellMode;
 
 // Last packet times from BMS and EUC
 volatile unsigned long lastEucPacketTime = 0UL;
@@ -289,17 +293,15 @@ void setup() {
 
   EEPROM.get (0, ee);
   if (ee.magic != EEPROM_MAGIC) {
-    Serial.printf ("Magic in EEPROM mismatch 0x%02x<>0x%02x. Initializing EEPROM...\n", ee.magic, EEPROM_MAGIC);
+    Serial.printf ("Magic in EEPROM mismatch 0x%02x<>0x%02x. Initializing trip to zero...\n", ee.magic, EEPROM_MAGIC);
     ee.magic = EEPROM_MAGIC;
     ee.mDistance = 0;
     ee.mTopSpeed = 0;
-    EEPROM.put (0, ee);
-    EEPROM.commit();
   }  
 
   // Scan devices
   BLEScan* pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new EucAdvertisedDeviceCallbacks());
+  pBLEScan->setAdvertisedDeviceCallbacks (new EucAdvertisedDeviceCallbacks());
   pBLEScan->setActiveScan (true);
   pBLEScan->start (SCAN_TIMEOUT);
 
@@ -336,13 +338,25 @@ void displaySet (String field, double value, int decimalPlaces) {
 void displayBatteryCell (uint8_t index) {
   String batField = String(F("bat")) + String(index + 1);
 
-  displaySet (batField, bms.mCellVoltages [index], 3);
+  float val;
+  uint8_t red, green;
+  if (batteryCellMode == BatteryCellMode::voltages) {
+    val = bms.mCellVoltages [index];
+    red = bms.mMinVoltageCell;
+    green = bms.mMaxVoltageCell;
+  } else {
+    val = bms.mCellResistances [index];
+    green = bms.mMinResistanceCell;
+    red = bms.mMaxResistanceCell;
+  }
+
+  displaySet (batField, val, 3);
 
   display.print (batField);
   display.print (F(".pco="));
-  if (index == bms.mMinVoltageCell) {
+  if (index == red) {
     display.print (NEXTION_RED_COLOR);
-  } else if (index == bms.mMaxVoltageCell) {
+  } else if (index == green) {
     display.print (NEXTION_GREEN_COLOR);
   } else {
     display.print (NEXTION_SILVER_COLOR);
@@ -421,6 +435,13 @@ void handleDisplay() {
       case 'S':
         switchPage (NEXTION_PAGE_SETTINGS);
         break;
+      case 'b':
+        if (batteryCellMode == BatteryCellMode::resistances) {
+          batteryCellMode = BatteryCellMode::voltages;
+        } else {
+          batteryCellMode = BatteryCellMode::resistances;
+        }
+        break;
       default:
         Serial.printf("<< DISPLAY: %02x\n", val);
         break;
@@ -457,6 +478,7 @@ void loop() {
         uint16_t batteryLevel = bms.mPercentRemaining;
         uint16_t topSpeed = ee.mTopSpeed;
         uint32_t distance = ee.mDistance;
+
         uint32_t power = (uint32_t) round (bms.mTotalVoltage * bms.mCurrent);
         uint32_t load = map (power, 0, GW_MAX_POWER, 0, 100);
 
@@ -464,7 +486,10 @@ void loop() {
 
         displaySet (F("speed"), speed);
 
-        display.print (F("topSpeed.txt=\"max. ")); display.print (topSpeed); display.print(F("km/h\"")); displayCommit();
+        display.print (F("topSpeed.txt=\"max. "));
+        display.print (topSpeed);
+        display.print(F("km/h\""));
+        displayCommit();
 
         displaySet (F("batPercent"), batteryLevel);
 
@@ -535,6 +560,8 @@ void loop() {
         displaySet (F("batAvg"), bms.mAvgCellVoltage, 3);
 
         displaySet (F("batDiff"), bms.mDeltaCellVoltage, 3);
+
+        displaySet (F("cellsCapt"), (batteryCellMode == BatteryCellMode::voltages) ? F("Voltages:") : F("Resistances:"));
 
         for (uint8_t i = 0; i < NUM_CELLS; i++) {
           displayBatteryCell (i);
@@ -832,13 +859,13 @@ int16_t signedShortFromBytesBE(uint8_t* bytes, int starting, size_t length) {
 }
 
 // Updates the maximum speed.
-void setTopSpeed(int topSpeed) {
-  if (topSpeed > 60) {
+void updateTopSpeed() {
+  if (wd.mSpeed > 60) {
     return;
   }
 
-  if (ee.mTopSpeed < topSpeed) {
-    ee.mTopSpeed = topSpeed;
+  if (ee.mTopSpeed < wd.mSpeed) {
+    ee.mTopSpeed = wd.mSpeed;
   }
 }
 
@@ -882,34 +909,23 @@ void decodeEuc(uint8_t* pData, size_t length) {
 
 // Processing the complete Begode packet.
 void processEucPacket(uint8_t* buff, size_t length) {
+  lastEucPacketTime = millis();
+
   if (buff[18] == 0x00) {
     uint16_t voltage = shortFromBytesBE(buff, 2, length);
     uint16_t speed = (uint16_t)abs((int16_t)round(signedShortFromBytesBE(buff, 4, length) * 3.6 / 100.0));
     int16_t phaseCurrent = signedShortFromBytesBE(buff, 10, length) * -1;
     int16_t temperature = (int16_t)round((((float)signedShortFromBytesBE(buff, 12, length) / 340.0) + 36.53) * 100);  // mpu6050
 
-    // Voltage and battery percentage are read from BMS. So this is not used.
-    uint16_t battery;
-    if (voltage > 6680) {
-      battery = 100;
-    } else if (voltage > 5440) {
-      battery = (uint16_t)(voltage - 5380) / 13;
-    } else if (voltage > 5290) {
-      battery = (uint16_t)round((voltage - 5290) / 32.5);
-    } else {
-      battery = 0;
-    }
-
     voltage = (uint16_t) round((double)voltage * 1.5);
 
     wd.mSpeed = speed;
-    setTopSpeed(speed);
+    updateTopSpeed();
+
     wd.mTemperature = temperature;
     wd.mPhaseCurrent = phaseCurrent;
     wd.mVoltage = voltage;
-    wd.mBattery = battery;
 
-    lastEucPacketTime = millis();
   } else if (buff[18] == 0x04) {
     uint32_t totalDistance = longFromBytesBE(buff, 2, length);
     wd.mTotalDistance = totalDistance;
@@ -929,8 +945,6 @@ void processEucPacket(uint8_t* buff, size_t length) {
     }
 
     wd.mStartDistance = totalDistance;
-
-    lastEucPacketTime = millis();
   }
 }
 
@@ -1067,6 +1081,8 @@ void processBms02Data (uint8_t* data, size_t length) {
 
   bms.mMinCellVoltage = 100.0f;
   bms.mMaxCellVoltage = -100.0f;
+  float minCellResistance = 100.0f;
+  float maxCellResistance = -100.0f;
   for (uint8_t i = 0; i < NUM_CELLS; i++) {
     float cell_voltage = (float) jk_get_16bit(i * 2 + 6) * 0.001f;
     float cell_resistance = (float) jk_get_16bit(i * 2 + 64 + offset) * 0.001f;
@@ -1079,6 +1095,16 @@ void processBms02Data (uint8_t* data, size_t length) {
     if (cell_voltage > bms.mMaxCellVoltage) {
       bms.mMaxCellVoltage = cell_voltage;
       bms.mMaxVoltageCell = i;
+    }
+
+    if (cell_resistance < minCellResistance) {
+      minCellResistance = cell_resistance;
+      bms.mMinResistanceCell = i;
+    }
+
+    if (cell_resistance > maxCellResistance) {
+      maxCellResistance = cell_resistance;
+      bms.mMaxResistanceCell = i;
     }
 
     bms.mCellVoltages[i] = cell_voltage;
