@@ -31,6 +31,7 @@
 #define NEXTION_SILVER_COLOR 50712
 #define NEXTION_GREEN_COLOR  34784
 #define NEXTION_RED_COLOR    64171
+#define NEXTION_YELLOW_COLOR 65504
 
 // Page indexes on Nextion display.
 #define NEXTION_PAGE_ABOUT 0
@@ -51,7 +52,9 @@
 #define GW_PEDALS_MODE_MEDIUM 1
 #define GW_PEDALS_MODE_SOFT 0
 #define GW_SPEED_INCREMENT 3
-#define GW_MAX_POWER 5000
+
+#define EUC_MAX_POWER 10000
+#define EUC_MAX_CHG_POWER 2500
 
 // The minimum distance in meters when a trip is written to the EEPROM when stopping
 #define MIN_DISTANCE_TO_SAVE_EEPROM 100L
@@ -335,6 +338,13 @@ void displaySet (String field, double value, int decimalPlaces) {
   displayCommit();
 }
 
+void displaySetPco (String field, uint16_t color) {
+  display.print (field);
+  display.print (F(".pco="));
+  display.print (color);
+  displayCommit();
+}
+
 void displayBatteryCell (uint8_t index) {
   String batField = String(F("bat")) + String(index + 1);
 
@@ -352,16 +362,15 @@ void displayBatteryCell (uint8_t index) {
 
   displaySet (batField, val, 3);
 
-  display.print (batField);
-  display.print (F(".pco="));
+  uint16_t color;
   if (index == red) {
-    display.print (NEXTION_RED_COLOR);
+    color = NEXTION_RED_COLOR;
   } else if (index == green) {
-    display.print (NEXTION_GREEN_COLOR);
+    color = NEXTION_GREEN_COLOR;
   } else {
-    display.print (NEXTION_SILVER_COLOR);
+    color = NEXTION_SILVER_COLOR;
   }
-  displayCommit();
+  displaySetPco (batField, color);
 }
 
 // Save the trip if at least MIN_DISTANCE_TO_SAVE_EEPROM meter was covered.
@@ -472,15 +481,23 @@ void loop() {
       case NEXTION_PAGE_MAIN : {
         double voltage = bms.mTotalVoltage;
         uint16_t speed = wd.mSpeed;
-        int32_t totalDistance = (int32_t)round(wd.mTotalDistance / 1000.0);
+        uint32_t totalDistance = (uint32_t)round(wd.mTotalDistance / 1000.0);
         double phaseCurrent = wd.mPhaseCurrent / 100.0;
         int16_t temperature = wd.mTemperature / 100;
         uint16_t batteryLevel = bms.mPercentRemaining;
         uint16_t topSpeed = ee.mTopSpeed;
         uint32_t distance = ee.mDistance;
 
-        uint32_t power = (uint32_t) round (bms.mTotalVoltage * bms.mCurrent);
-        uint32_t load = map (power, 0, GW_MAX_POWER, 0, 100);
+        bool charging = (bms.mCurrent > 0);
+
+        int power, load;
+        if (charging) {
+          power = constrain ((int) round (voltage * bms.mCurrent), 0, EUC_MAX_CHG_POWER);
+          load = map (power, 0, EUC_MAX_CHG_POWER, 0, 100);
+        } else {
+          power = constrain ((int) abs (round(voltage * phaseCurrent)), 0, EUC_MAX_POWER);
+          load = -1 * map (power, 0, EUC_MAX_POWER, 0, 100);
+        }
 
         Serial.printf ("EUC: BV=%.2fV, BL=%d%%, PC=%.2fA, TEMP=%d°C, LOAD=%d%%, SPD=%dkm/h, TOP_SPD=%dkm/h, DIST=%dm, TOT_DIST=%dkm\n", voltage, batteryLevel, phaseCurrent, temperature, load, speed, topSpeed, distance, totalDistance);
 
@@ -503,15 +520,23 @@ void loop() {
         displaySet (F("pwm"), load);
 
         display.print(F("km.txt=\""));
-        if (distance < 1000) {
-          display.print(distance);
-          display.print("m");
+        if (charging) {
+          display.print (F("C:"));
+          display.print (power);
+          display.print ('W');
         } else {
-          display.print(distance / 1000.0, 1);
-          display.print("km");
+          if (distance < 1000) {
+            display.print(distance);
+            display.print('m');
+          } else {
+            display.print(distance / 1000.0, 1);
+            display.print(F("km"));
+          }
         }
         display.print('"');
         displayCommit();
+
+        displaySetPco (F("km"), charging ? NEXTION_GREEN_COLOR : NEXTION_YELLOW_COLOR);
 
         display.print(F("totalKm.txt=\"total "));
         display.print(totalDistance);
@@ -1063,14 +1088,8 @@ void processBmsPacket(uint8_t* pData, size_t length) {
   }
 }
 
-// Function to convert uint32 to float for BMS.
-float ieee_float_(uint32_t f) {
-  float ret;
-  memcpy(&ret, &f, sizeof(float));
-  return ret;
-}
-
 // Process the 0x02 BMS packet.
+// https://github.com/syssi/esphome-jk-bms/blob/main/components/jk_bms_ble/jk_bms_ble.cpp
 void processBms02Data (uint8_t* data, size_t length) {
   auto jk_get_16bit = [&](size_t i) -> uint16_t { return (uint16_t(data[i + 1]) << 8) | (uint16_t(data[i + 0]) << 0); };
   auto jk_get_32bit = [&](size_t i) -> uint32_t {
