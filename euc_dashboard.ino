@@ -18,6 +18,9 @@
 // lose connection and reboot.
 #define MAX_PACKET_TIME 10000
 
+// Battery percent grow to assume charged
+#define ASSUME_CHARGED_PERCENT 4.0
+
 // Display is connected to UART 2 on ESP32
 #define display Serial2
 
@@ -39,7 +42,7 @@
 #define NEXTION_PAGE_LOG 2
 #define NEXTION_PAGE_TUNNEL 3
 #define NEXTION_PAGE_BATTERY 4
-#define NEXTION_PAGE_CONFIRM_RESET_TRIP 5
+#define NEXTION_PAGE_TRIP 5
 #define NEXTION_PAGE_TEMPERATURES 6
 #define NEXTION_PAGE_SETTINGS 7
 
@@ -60,7 +63,7 @@
 #define MIN_DISTANCE_TO_SAVE_EEPROM 100L
 
 // Magic to detect empty EEPROM
-#define EEPROM_MAGIC 0xD2
+#define EEPROM_MAGIC 0xD3
 
 // BLE services; they are the same for BMS and EUC, however, in principle, they are declared separately.
 static BLEUUID serviceUUID_EUC("0000ffe0-0000-1000-8000-00805f9b34fb");
@@ -98,6 +101,11 @@ struct EepromData {
   uint8_t magic;
   uint16_t mTopSpeed;
   uint32_t mDistance;
+  uint16_t mMaxPower;
+  uint16_t mMaxChargePower;
+  unsigned long mRideTime;
+  float mLastBatteryPercentRemaining;
+  uint32_t mDistanceLastCharge;
 } ee;
 
 // Data structure from EUC
@@ -172,6 +180,9 @@ enum BatteryCellMode {
 // Last packet times from BMS and EUC
 volatile unsigned long lastEucPacketTime = 0UL;
 volatile unsigned long lastBmsPacketTime = 0UL;
+
+// Last update of average speed.
+unsigned long lastRideTime = 0UL;
 
 // Clears display screen.
 void clearScreen() {
@@ -300,7 +311,12 @@ void setup() {
     ee.magic = EEPROM_MAGIC;
     ee.mDistance = 0;
     ee.mTopSpeed = 0;
-  }  
+    ee.mRideTime = 0;
+    ee.mMaxPower = 0;
+    ee.mMaxChargePower = 0;
+    ee.mLastBatteryPercentRemaining = -1;
+    ee.mDistanceLastCharge = 0;
+  }
 
   // Scan devices
   BLEScan* pBLEScan = BLEDevice::getScan();
@@ -323,17 +339,37 @@ void displaySet (String field, uint32_t value) {
 }
 
 void displaySet (String field, String value) {
+  displaySet (field, value, "");
+}
+
+void displaySet (String field, String value, String unit) {
+  displaySet ("", field, value, unit);
+}
+
+void displaySet (String prefix, String field, String value, String unit) {
   display.print (field);
   display.print (F(".txt=\""));
+  display.print (prefix);
   display.print (value);
+  display.print (unit);
   display.print ('"');
   displayCommit();
 }
 
 void displaySet (String field, double value, int decimalPlaces) {
+  displaySet ("", field, value, decimalPlaces, "");
+}
+
+void displaySet (String field, double value, int decimalPlaces, String unit) {
+  displaySet ("", field, value, decimalPlaces, unit);
+}
+
+void displaySet (String prefix, String field, double value, int decimalPlaces, String unit) {
   display.print (field);
   display.print (F(".txt=\""));
+  display.print (prefix);
   display.print (value, decimalPlaces);
+  display.print (unit);
   display.print ('"');
   displayCommit();
 }
@@ -373,6 +409,18 @@ void displayBatteryCell (uint8_t index) {
   displaySetPco (batField, color);
 }
 
+String timeToString (unsigned long t) {
+ char str[25];
+ 
+ long h = t / 3600;
+ long d = h / 24;
+ t = t % 3600;
+ int m = t / 60;
+ int s = t % 60;
+ sprintf(str, "(%02ld) %02ld:%02d:%02d", d, h, m, s);
+ return String (str);
+}
+
 // Save the trip if at least MIN_DISTANCE_TO_SAVE_EEPROM meter was covered.
 void saveTrip() {
   EepromData ed;
@@ -389,6 +437,7 @@ void resetTrip() {
   wd.mStartDistance = wd.mTotalDistance;
   ee.mDistance = 0;
   ee.mTopSpeed = 0;
+  ee.mRideTime = 0;
 
   saveTrip();
   Serial.print (F("Trip reset..."));
@@ -416,7 +465,7 @@ void handleDisplay() {
         resetTrip();
         break;
       case 'r':
-        switchPage (NEXTION_PAGE_CONFIRM_RESET_TRIP);
+        switchPage (NEXTION_PAGE_TRIP);
         break;
       case 'T':
         switchPage (NEXTION_PAGE_TEMPERATURES);
@@ -485,7 +534,7 @@ void loop() {
         double phaseCurrent = wd.mPhaseCurrent / 100.0;
         int16_t temperature = wd.mTemperature / 100;
         uint16_t batteryLevel = bms.mPercentRemaining;
-        uint16_t topSpeed = ee.mTopSpeed;
+        uint32_t distanceSinceCharge = ee.mDistanceLastCharge;
         uint32_t distance = ee.mDistance;
 
         bool charging = (bms.mCurrent > 0);
@@ -494,26 +543,26 @@ void loop() {
         if (charging) {
           power = constrain ((int) round (voltage * bms.mCurrent), 0, EUC_MAX_CHG_POWER);
           load = map (power, 0, EUC_MAX_CHG_POWER, 0, 100);
+          if (power > ee.mMaxChargePower) {
+            ee.mMaxChargePower = power;
+          }
         } else {
-          power = constrain ((int) abs (round(voltage * phaseCurrent)), 0, EUC_MAX_POWER);
+          power = constrain ((int) abs (round(voltage * bms.mCurrent)), 0, EUC_MAX_POWER);
           load = -1 * map (power, 0, EUC_MAX_POWER, 0, 100);
+          if (power > ee.mMaxPower) {
+            ee.mMaxPower = power;
+          }
         }
 
-        Serial.printf ("EUC: BV=%.2fV, BL=%d%%, PC=%.2fA, TEMP=%d°C, LOAD=%d%%, SPD=%dkm/h, TOP_SPD=%dkm/h, DIST=%dm, TOT_DIST=%dkm\n", voltage, batteryLevel, phaseCurrent, temperature, load, speed, topSpeed, distance, totalDistance);
+        Serial.printf ("EUC: BV=%.2fV, BL=%d%%, PC=%.2fA, TEMP=%d°C, LOAD=%d%%, SPD=%dkm/h, DIST=%dm, TOT_DIST=%dkm\n", voltage, batteryLevel, phaseCurrent, temperature, load, speed, distance, totalDistance);
 
         displaySet (F("speed"), speed);
 
-        display.print (F("topSpeed.txt=\"max. "));
-        display.print (topSpeed);
-        display.print(F("km/h\""));
-        displayCommit();
+        displaySet (F("sch. "), F("kmSinceCharge"), distanceSinceCharge / 1000.0, 1, F("km"));
 
         displaySet (F("batPercent"), batteryLevel);
 
-        display.print(F("batVolt.txt=\""));
-        display.print(voltage, 1);
-        display.print("V\"");
-        displayCommit();
+        displaySet (F("batVolt"), voltage, 1, F("V"));
 
         displaySet (F("temp"), temperature);
 
@@ -538,10 +587,7 @@ void loop() {
 
         displaySetPco (F("km"), charging ? NEXTION_GREEN_COLOR : NEXTION_YELLOW_COLOR);
 
-        display.print(F("totalKm.txt=\"total "));
-        display.print(totalDistance);
-        display.print("km\"");
-        displayCommit();
+        displaySet (F("total "), F("totalKm"), String(totalDistance), F("km"));
 
         display.print (F("light.pic="));
         display.print (wd.mLightMode == 0 ? NEXTION_II_LIGHT_OFF : NEXTION_II_LIGHT_ON);
@@ -613,6 +659,30 @@ void loop() {
         
         break;
       }
+      case NEXTION_PAGE_TRIP : {
+        displaySet (F("maxSpeed"), ee.mTopSpeed, 0, F("km/h"));
+
+        double avgSpeed = 0;
+        if (ee.mRideTime > 0) {
+          avgSpeed = ((double)ee.mDistance / 1000.0) / (ee.mRideTime / 1000.0 / 3600.0);
+        }
+
+        displaySet (F("avgSpeed"), avgSpeed, 0, F("km/h"));
+
+        displaySet (F("km"), ee.mDistance / 1000.0, 1, F("km"));
+
+        displaySet (F("kmSinceCharge"), ee.mDistanceLastCharge / 1000.0, 1, F("km"));
+
+        displaySet (F("totalKm"), wd.mTotalDistance / 1000.0, 0, F("km"));
+
+        displaySet (F("maxPower"), ee.mMaxPower, 0, F("W"));
+
+        displaySet (F("maxChargePower"), ee.mMaxChargePower, 0, F("W"));
+
+        displaySet (F("rideTime"), timeToString (ee.mRideTime));
+
+        break;
+      }
       default:
         break;
     }
@@ -620,6 +690,14 @@ void loop() {
     // Pokud se zastavilo (a ujelo vic jak ${MIN_DISTANCE_TO_SAVE_EEPROM} metru), tak se ulozi trip.
     if (wd.mSpeed == 0) {
       saveTrip();
+    }
+
+    if (wd.mSpeed > 0) {
+      unsigned long now = millis();
+      if (lastRideTime > 0UL) {
+        ee.mRideTime += (now - lastRideTime);
+      }
+      lastRideTime = now;
     }
   }
 
@@ -966,7 +1044,9 @@ void processEucPacket(uint8_t* buff, size_t length) {
     wd.mLightMode = buff[15] & 0x03;
 
     if (wd.mStartDistance > 0) {
-      ee.mDistance += totalDistance - wd.mStartDistance;
+      uint32_t dist = totalDistance - wd.mStartDistance;
+      ee.mDistance += dist;
+      ee.mDistanceLastCharge += dist; 
     }
 
     wd.mStartDistance = totalDistance;
@@ -1146,52 +1226,10 @@ void processBms02Data (uint8_t* data, size_t length) {
 
   bms.mPercentRemaining = (float) data[141 + offset];
   bms.mChargeCycles = (uint16_t) jk_get_32bit(150 + offset);
+
+  if (bms.mPercentRemaining - ASSUME_CHARGED_PERCENT > ee.mLastBatteryPercentRemaining) {
+    ee.mDistanceLastCharge = 0;
+  }
+
+  ee.mLastBatteryPercentRemaining = bms.mPercentRemaining;
 }
-
-/*
-    Taken from: https://github.com/Wheellog/Wheellog.Android
-
-    Gotway/Begode reverse-engineered protocol
-
-    Gotway uses byte stream from a serial port via Serial-to-BLE adapter.
-    There are two types of frames, A and B. Normally they alternate.
-    Most numeric values are encoded as Big Endian (BE) 16 or 32 bit integers.
-    The protocol has no checksums.
-
-    Since the BLE adapter has no serial flow control and has limited input buffer,
-    data come in variable-size chunks with arbitrary delays between chunks. Some
-    bytes may even be lost in case of BLE transmit buffer overflow.
-
-         0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
-        -----------------------------------------------------------------------
-     A: 55 AA 19 F0 00 00 00 00 00 00 01 2C FD CA 00 01 FF F8 00 18 5A 5A 5A 5A
-     B: 55 AA 00 0A 4A 12 48 00 1C 20 00 2A 00 03 00 07 00 08 04 18 5A 5A 5A 5A
-     A: 55 AA 19 F0 00 00 00 00 00 00 00 F0 FD D2 00 01 FF F8 00 18 5A 5A 5A 5A
-     B: 55 AA 00 0A 4A 12 48 00 1C 20 00 2A 00 03 00 07 00 08 04 18 5A 5A 5A 5A
-        ....
-
-    Frame A:
-        Bytes 0-1:   frame header, 55 AA
-        Bytes 2-3:   BE voltage, fixed point, 1/100th (assumes 67.2 battery, rescale for other voltages)
-        Bytes 4-5:   BE speed, fixed point, 3.6 * value / 100 km/h
-        Bytes 6-9:   BE distance, 32bit fixed point, meters
-        Bytes 10-11: BE current, signed fixed point, 1/100th amperes
-        Bytes 12-13: BE temperature, (value / 340 + 36.53) / 100, Celsius degrees (MPU6050 native data)
-        Bytes 14-17: unknown
-        Byte  18:    frame type, 00 for frame A
-        Byte  19:    18 frame footer
-        Bytes 20-23: frame footer, 5A 5A 5A 5A
-
-    Frame B:
-        Bytes 0-1:   frame header, 55 AA
-        Bytes 2-5:   BE total distance, 32bit fixed point, meters
-        Byte  6:     pedals mode (high nibble), speed alarms (low nibble)
-        Bytes 7-12:  unknown
-        Byte  13:    LED mode
-        Bytes 14-17: unknown
-        Byte  18:    frame type, 04 for frame B
-        Byte  19:    18 frame footer
-        Bytes 20-23: frame footer, 5A 5A 5A 5A
-
-    Unknown bytes may carry out other data, but currently not used by the parser.
-*/
