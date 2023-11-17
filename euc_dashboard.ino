@@ -45,6 +45,7 @@
 #define NEXTION_PAGE_TRIP 5
 #define NEXTION_PAGE_TEMPERATURES 6
 #define NEXTION_PAGE_SETTINGS 7
+#define NEXTION_PAGE_ERRORS 8
 
 // Image indexes
 #define NEXTION_II_LIGHT_OFF 9
@@ -63,7 +64,11 @@
 #define MIN_DISTANCE_TO_SAVE_EEPROM 100L
 
 // Magic to detect empty EEPROM
-#define EEPROM_MAGIC 0xD3
+#define EEPROM_MAGIC 0xDA
+
+// Maximum packets sizes
+#define BMS_MAX_PACKET_SIZE 320
+#define EUC_MAX_PACKET_SIZE 24
 
 // BLE services; they are the same for BMS and EUC, however, in principle, they are declared separately.
 static BLEUUID serviceUUID_EUC("0000ffe0-0000-1000-8000-00805f9b34fb");
@@ -103,9 +108,10 @@ struct EepromData {
   uint32_t mDistance;
   uint16_t mMaxPower;
   uint16_t mMaxChargePower;
-  unsigned long mRideTime;
+  uint64_t mRideTime;
   float mLastBatteryPercentRemaining;
   uint32_t mDistanceLastCharge;
+  uint64_t mTotalRuntime; 
 } ee;
 
 // Data structure from EUC
@@ -122,6 +128,8 @@ struct WheelData {
   uint8_t mLightMode;
   uint8_t mPedalsMode;
   int8_t mTiltbackSpeed;
+
+  uint8_t mErrors;
 } wd;
 
 // Data structure from BMS
@@ -144,6 +152,7 @@ struct BmsData {
   float mBalancingCurrent;
   float mPercentRemaining;
   uint16_t mChargeCycles;
+  uint16_t mErrors;
 } bms;
 
 // Unpacker state
@@ -171,6 +180,7 @@ UnpackerData bmsUnpacker;
 String curDisplayLine = "";
 uint8_t curDisplayRow = 0;
 uint8_t displayedPage = 0;
+uint8_t lastDisplayedPage = 0xFF;
 
 enum BatteryCellMode {
   voltages,
@@ -183,6 +193,42 @@ volatile unsigned long lastBmsPacketTime = 0UL;
 
 // Last update of average speed.
 unsigned long lastRideTime = 0UL;
+// Last update of total runtime.
+unsigned long lastTotalRuntimeTime = 0UL;
+
+// BMS errors
+#define BMS_ERRORS_SIZE 16
+const char* PROGMEM BMS_ERRORS[BMS_ERRORS_SIZE] = {
+    "Charge Overtemperature",               // 0000 0000 0000 0001
+    "Charge Undertemperature",              // 0000 0000 0000 0010
+    "Error 0x00 0x04",                      // 0000 0000 0000 0100
+    "Cell Undervoltage",                    // 0000 0000 0000 1000
+    "Error 0x00 0x10",                      // 0000 0000 0001 0000
+    "Error 0x00 0x20",                      // 0000 0000 0010 0000
+    "Error 0x00 0x40",                      // 0000 0000 0100 0000
+    "Error 0x00 0x80",                      // 0000 0000 1000 0000
+    "Error 0x01 0x00",                      // 0000 0001 0000 0000
+    "Error 0x02 0x00",                      // 0000 0010 0000 0000
+    "Cell count is not equal to settings",  // 0000 0100 0000 0000
+    "Current sensor anomaly",               // 0000 1000 0000 0000
+    "Cell Overvoltage",                     // 0001 0000 0000 0000
+    "Error 0x20 0x00",                      // 0010 0000 0000 0000
+    "Charge overcurrent protection",        // 0100 0000 0000 0000
+    "Error 0x80 0x00",                      // 1000 0000 0000 0000
+};
+
+// EUC errors
+#define EUC_ERRORS_SIZE 8
+const char* PROGMEM EUC_ERRORS[EUC_ERRORS_SIZE] = {
+    "Over Power",
+    "Speed Limit 2",
+    "Speed Limit 1",
+    "Low Voltage",
+    "Over Voltage",
+    "Over Temperature",
+    "Error Hall Sensors",
+    "Transport Mode",
+};
 
 // Clears display screen.
 void clearScreen() {
@@ -287,13 +333,13 @@ void setup() {
   clearScreen();
 
   eucUnpacker.state = UnpackerState::unknown;
-  eucUnpacker.buffer = (uint8_t*)malloc(24 * sizeof(uint8_t));
-  memset(eucUnpacker.buffer, 0, 24);
+  eucUnpacker.buffer = (uint8_t*)malloc(EUC_MAX_PACKET_SIZE * sizeof(uint8_t));
+  memset(eucUnpacker.buffer, 0, EUC_MAX_PACKET_SIZE);
   eucUnpacker.pos = 0;
 
   bmsUnpacker.state = UnpackerState::unknown;
-  bmsUnpacker.buffer = (uint8_t*)malloc(320 * sizeof(uint8_t));
-  memset(bmsUnpacker.buffer, 0, 320);
+  bmsUnpacker.buffer = (uint8_t*)malloc(BMS_MAX_PACKET_SIZE * sizeof(uint8_t));
+  memset(bmsUnpacker.buffer, 0, BMS_MAX_PACKET_SIZE);
   bmsUnpacker.pos = 0;
 
   // This delay is here because it will run at the same time as the EUC so it has time to start.
@@ -316,6 +362,7 @@ void setup() {
     ee.mMaxChargePower = 0;
     ee.mLastBatteryPercentRemaining = -1;
     ee.mDistanceLastCharge = 0;
+    ee.mTotalRuntime = 0;
   }
 
   // Scan devices
@@ -438,6 +485,9 @@ void resetTrip() {
   ee.mDistance = 0;
   ee.mTopSpeed = 0;
   ee.mRideTime = 0;
+  ee.mMaxPower = 0;
+  ee.mMaxChargePower = 0;
+  lastRideTime = 0UL;
 
   saveTrip();
   Serial.print (F("Trip reset..."));
@@ -493,6 +543,9 @@ void handleDisplay() {
       case 'S':
         switchPage (NEXTION_PAGE_SETTINGS);
         break;
+      case 'E' :
+        switchPage (NEXTION_PAGE_ERRORS);
+        break;
       case 'b':
         if (batteryCellMode == BatteryCellMode::resistances) {
           batteryCellMode = BatteryCellMode::voltages;
@@ -539,6 +592,8 @@ void loop() {
 
         bool charging = (bms.mCurrent > 0);
 
+        bool hasErrors = bms.mErrors || wd.mErrors;
+
         int power, load;
         if (charging) {
           power = constrain ((int) round (voltage * bms.mCurrent), 0, EUC_MAX_CHG_POWER);
@@ -556,7 +611,9 @@ void loop() {
 
         Serial.printf ("EUC: BV=%.2fV, BL=%d%%, PC=%.2fA, TEMP=%d°C, LOAD=%d%%, SPD=%dkm/h, DIST=%dm, TOT_DIST=%dkm\n", voltage, batteryLevel, phaseCurrent, temperature, load, speed, distance, totalDistance);
 
-        displaySet (F("speed"), speed);
+        if (!hasErrors) {
+          displaySet (F("speed"), speed);
+        }
 
         displaySet (F("sch. "), F("kmSinceCharge"), distanceSinceCharge / 1000.0, 1, F("km"));
 
@@ -592,6 +649,20 @@ void loop() {
         display.print (F("light.pic="));
         display.print (wd.mLightMode == 0 ? NEXTION_II_LIGHT_OFF : NEXTION_II_LIGHT_ON);
         displayCommit();
+
+        display.print (F("vis err,"));
+        display.print (hasErrors ? 1 : 0);
+        displayCommit();
+        if (hasErrors) {
+          String s = "";
+          if (bms.mErrors) {
+            s += F("BMS ERRORS\r");
+          }
+          if (wd.mErrors) {
+            s += F("EUC ERRORS\r");
+          }
+          displaySet (F("err"), s);
+        }
 
         break;
       }
@@ -637,6 +708,7 @@ void loop() {
         for (uint8_t i = 0; i < NUM_CELLS; i++) {
           displayBatteryCell (i);
         }
+
         break;
       }
       case NEXTION_PAGE_TEMPERATURES : {
@@ -681,24 +753,71 @@ void loop() {
 
         displaySet (F("rideTime"), timeToString (ee.mRideTime));
 
+        displaySet (F("totalRuntime"), timeToString (ee.mTotalRuntime));
+
+        break;
+      }
+      case NEXTION_PAGE_ERRORS : {
+        if (lastDisplayedPage != displayedPage) {
+          uint16_t y = 35;
+          uint8_t i;
+          if (bms.mErrors) {
+            for (i = 0; i < BMS_ERRORS_SIZE; i++) {
+              if (bms.mErrors & (1 << i)) {
+                display.print(F("xstr 2,"));
+                display.print(y);
+                display.print(F(",396,25,0,RED,BLACK,0,1,3,\"BMS: "));
+                display.print(BMS_ERRORS[i]);
+                display.print("\"");
+                displayCommit();
+                y += 25;
+              }
+            }
+          }
+
+          if (wd.mErrors) {
+            for (i = 0; i < EUC_ERRORS_SIZE; i++) {
+              if (wd.mErrors & (1 << i)) {
+                display.print(F("xstr 2,"));
+                display.print(y);
+                display.print(F(",396,25,0,RED,BLACK,0,1,3,\"EUC: "));
+                display.print(EUC_ERRORS[i]);
+                display.print("\"");
+                displayCommit();
+                y += 25;
+              }
+            }
+          }
+        }
+
         break;
       }
       default:
         break;
     }
 
-    // Pokud se zastavilo (a ujelo vic jak ${MIN_DISTANCE_TO_SAVE_EEPROM} metru), tak se ulozi trip.
+    lastDisplayedPage = displayedPage;
+
+    // If it stopped (and traveled more than ${MIN_DISTANCE_TO_SAVE_EEPROM} meters), then the trip is saved.
     if (wd.mSpeed == 0) {
       saveTrip();
     }
 
+    // Riding time update.
+    unsigned long now = millis();
     if (wd.mSpeed > 0) {
-      unsigned long now = millis();
       if (lastRideTime > 0UL) {
         ee.mRideTime += (now - lastRideTime);
       }
       lastRideTime = now;
+    } else {
+      lastRideTime = 0UL;
     }
+
+    if (lastTotalRuntimeTime > 0UL) {
+      ee.mTotalRuntime += (now - lastTotalRuntimeTime);
+    }
+    lastTotalRuntimeTime = now;
   }
 
   // Kontrola zdali chodi pakety.
@@ -855,6 +974,7 @@ bool connectToServers() {
 
 // Restart ESP.
 void reboot(String cause) {
+  saveTrip();
   switchPage (NEXTION_PAGE_LOG);
   clearScreen();
   logLine(cause);
@@ -927,7 +1047,7 @@ void serialTunnel() {
 }
 
 /*
-  Conversion methods for BigEndian that use Begode.
+  Conversion methods for BigEndian that uses Begode.
 */
 
 uint32_t longFromBytesBE(uint8_t* bytes, int starting, size_t length) {
@@ -978,12 +1098,12 @@ bool eucUnpackerAddChar(uint8_t c) {
     eucUnpacker.buffer[eucUnpacker.pos++] = c;
     eucUnpacker.lastChar = c;
     size_t size = eucUnpacker.pos;
-    if ((size == 20 && c != 0x18) || (size > 20 && size <= 24 && c != 0x5A)) {
+    if ((size == 20 && c != 0x18) || (size > 20 && size <= EUC_MAX_PACKET_SIZE && c != 0x5A)) {
       Serial.println(F("Invalid frame footer (expected 18 5A 5A 5A 5A)"));
       eucUnpacker.state = UnpackerState::unknown;
       return false;
     }
-    if (size == 24) {
+    if (size == EUC_MAX_PACKET_SIZE) {
       eucUnpacker.state = UnpackerState::done;
       return true;
     }
@@ -1040,6 +1160,8 @@ void processEucPacket(uint8_t* buff, size_t length) {
     if (wd.mTiltbackSpeed >= 100) {
       wd.mTiltbackSpeed = 0;
     }
+
+    wd.mErrors = buff[12] & 0xFF;
 
     wd.mLightMode = buff[15] & 0x03;
 
@@ -1099,7 +1221,7 @@ bool bmsUnpackerAddChar(uint8_t c) {
         Serial.println(')');
         return false;
       }
-    } else if (size == 320) {
+    } else if (size == BMS_MAX_PACKET_SIZE) {
       uint8_t dataCrc = bmsUnpacker.buffer[size - 1];
       uint8_t calcCrc = crc8(bmsUnpacker.buffer, size - 1);
 
@@ -1223,6 +1345,8 @@ void processBms02Data (uint8_t* data, size_t length) {
   bms.mBmsTemperature = (float) ((int16_t) jk_get_16bit(112 + offset)) * 0.1f;
 
   bms.mBalancingCurrent = (float) ((int16_t) jk_get_16bit(138 + offset)) * 0.001f;
+
+  bms.mErrors = ((uint16_t(jk_get_16bit (134 + offset)) << 8) | (uint16_t (jk_get_16bit (135 + offset) << 0)));
 
   bms.mPercentRemaining = (float) data[141 + offset];
   bms.mChargeCycles = (uint16_t) jk_get_32bit(150 + offset);

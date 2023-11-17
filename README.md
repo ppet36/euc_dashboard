@@ -1,7 +1,7 @@
 # EUC dashboard
 Dashboard with ESP32, [Nextion NX4024T032](https://nextion.tech/datasheets/nx4024t032/) display for my DIY EUC based on Begode Nikola control board and [JK Smart BMS BD6A24S10P](https://www.jkbms.com/product/jk-bd6a24s10p/). I built them because the EUCs that are available in the market either have a small battery or are extremely expensive.
 
-In my EUC there is a 24s10p battery composed of Samsung INR21700-50E 4900mAh cells with a total capacity of almost 5kWh. This allows me to go on all-day trips and up to a distance of 160 km on a single charge. I carry the charger with me, so I can recharge for additional kilometers during lunch or sightseeing at the destination.
+In my EUC there is a 24s10p battery composed of Samsung INR21700-50E 4900mAh cells with a total capacity of almost 5kWh. This allows me to go on all-day trips and up to a distance of 160 km on a single charge.
 
 ![alt](/images/dash_int.jpeg?raw=true)
 ![alt](/images/dash.jpeg?raw=true)
