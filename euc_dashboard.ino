@@ -10,9 +10,15 @@
 
 #include "BLEDevice.h"
 #include <EEPROM.h>
+#include <Wire.h>
+#include <DS3231.h>
+#include "esp32_up_down_sd.h"
 
 // Frequency of display update.
 #define DISPLAY_UPDATE 500
+
+// SD update
+#define SD_UPDATE_TIME 1000
 
 // Time in milliseconds when a packet must be sent from EUC/BMS otherwise it is taken as
 // lose connection and reboot.
@@ -35,6 +41,7 @@
 #define NEXTION_GREEN_COLOR  34784
 #define NEXTION_RED_COLOR    64171
 #define NEXTION_YELLOW_COLOR 65504
+#define NEXTION_CYAN_COLOR   2047
 
 // Page indexes on Nextion display.
 #define NEXTION_PAGE_ABOUT 0
@@ -46,10 +53,14 @@
 #define NEXTION_PAGE_TEMPERATURES 6
 #define NEXTION_PAGE_SETTINGS 7
 #define NEXTION_PAGE_ERRORS 8
+#define NEXTION_PAGE_WIFI 9
+#define NEXTION_PAGE_SETTIME 10
 
 // Image indexes
 #define NEXTION_II_LIGHT_OFF 9
 #define NEXTION_II_LIGHT_ON 10
+#define NEXTION_II_SD_OFF 20
+#define NEXTION_II_SD_ON 21
 
 // Gotway pedals mode
 #define GW_PEDALS_MODE_HARD 2
@@ -69,6 +80,7 @@
 // Maximum packets sizes
 #define BMS_MAX_PACKET_SIZE 320
 #define EUC_MAX_PACKET_SIZE 24
+
 
 // BLE services; they are the same for BMS and EUC, however, in principle, they are declared separately.
 static BLEUUID serviceUUID_EUC("0000ffe0-0000-1000-8000-00805f9b34fb");
@@ -100,6 +112,10 @@ static boolean connected = false;
 // Characteristics.
 static BLERemoteCharacteristic* pRemoteEucCharacteristic;
 static BLERemoteCharacteristic* pRemoteBmsCharacteristic;
+
+// RTC
+DS3231 rtc;
+bool hasRtc = false;
 
 // Structure stored in EEPROM; contains trip data
 struct EepromData {
@@ -162,6 +178,25 @@ enum UnpackerState {
   done
 };
 
+// Current time part in set time
+enum CurrentTimePart {
+  year,
+  month,
+  day,
+  hour,
+  minute,
+  second
+} currentTimePart;
+
+struct SetTimeStruct {
+  uint16_t year;
+  uint8_t month;
+  uint8_t day;
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t second;
+} setTimeStruct;
+
 // Structure for silage of data from the BLE characteristic notification, because
 // record will never run out entirely in one packet.
 struct UnpackerData {
@@ -195,6 +230,8 @@ volatile unsigned long lastBmsPacketTime = 0UL;
 unsigned long lastRideTime = 0UL;
 // Last update of total runtime.
 unsigned long lastTotalRuntimeTime = 0UL;
+// Last write to SD card
+unsigned long lastSDWrite = 0UL;
 
 // BMS errors
 #define BMS_ERRORS_SIZE 16
@@ -230,12 +267,13 @@ const char* PROGMEM EUC_ERRORS[EUC_ERRORS_SIZE] = {
     "Transport Mode",
 };
 
+
 // Clears display screen.
-void clearScreen() {
+void clearScreen(bool refSerialTunnel = true) {
   display.print(F("cls BLACK"));
   displayCommit();
 
-  if (displayedPage == NEXTION_PAGE_LOG) {
+  if (refSerialTunnel && (displayedPage == NEXTION_PAGE_LOG)) {
     // This is the icon to switch to serial tunnel mode to update the display.
     display.print (F("ref p0"));
     displayCommit();
@@ -327,7 +365,7 @@ void setup() {
   Serial.begin(115200);
   display.begin(115200);
 
-  EEPROM.begin (sizeof(EepromData));
+  delay(2000);
 
   switchPage (NEXTION_PAGE_LOG);
   clearScreen();
@@ -342,18 +380,76 @@ void setup() {
   memset(bmsUnpacker.buffer, 0, BMS_MAX_PACKET_SIZE);
   bmsUnpacker.pos = 0;
 
-  // This delay is here because it will run at the same time as the EUC so it has time to start.
-  delay(2000);
-
   logLine(F("Starting EUC dashboard..."));
   BLEDevice::init("");
+
+  logLine(F("Initializing RTC..."));
+  if (Wire.begin()) {
+    logLine (F("Scanning I2C bus..."));
+    int devCount = 0;
+    for (byte i = 8; i < 120; i++) {
+      Wire.beginTransmission (i);
+      int error = Wire.endTransmission();
+      if (error == 0) {
+        log (F("Found address: "));
+        log (String(i));
+        log (F(" (0x"));
+        log (String (i, HEX));
+        logLine (F(")"));
+ 
+        devCount++;
+      } else if (error == 4) {
+        log (F("ERROR at address: "));
+        log (String(i));
+        log (F(" (0x"));
+        log (String (i, HEX));
+        logLine (F(")"));
+      }
+    }
+    log (F("Found "));      
+    log (String(devCount));
+    logLine (F(" device(s)."));
+
+    if (devCount > 0) {
+      rtc.setClockMode (false);
+ 
+      DateTime now = RTClib::now();
+      log (F("Current time is "));
+      log (String(now.year()));
+      log ("-");
+      log (String(now.month()));
+      log ("-");
+      log (String(now.day()));
+      log (" ");
+      log (String(now.hour()));
+      log (":");
+      log (String(now.minute()));
+      log (":");
+      logLine (String(now.second()));
+
+      hasRtc = (now.year() <= 2100);
+    } else {
+      logLine (F("ERROR; no RTC module found!"));
+    }
+  } else {
+    logLine (F("ERROR; Can't initialize I2C bus!"));
+  }
+
+  // Setup SD card
+  SD_setup();
+
+  delay (2000);
+  clearScreen();
+  logLine (F("Scanning BLE devices..."));
+
+  EEPROM.begin (sizeof(EepromData));
 
   memset(&wd, 0, sizeof(WheelData));
   memset(&bms, 0, sizeof(BmsData));
 
   EEPROM.get (0, ee);
   if (ee.magic != EEPROM_MAGIC) {
-    Serial.printf ("Magic in EEPROM mismatch 0x%02x<>0x%02x. Initializing trip to zero...\n", ee.magic, EEPROM_MAGIC);
+    Serial.printf ("Magic in EEPROM mismatch 0x%02x<>0x%02x. Initializing trip to zero...\r\n", ee.magic, EEPROM_MAGIC);
     ee.magic = EEPROM_MAGIC;
     ee.mDistance = 0;
     ee.mTopSpeed = 0;
@@ -494,6 +590,89 @@ void resetTrip() {
   switchPage (NEXTION_PAGE_MAIN);
 }
 
+// Update set time part highlight
+void updateSetTimePart() {
+  displaySetPco (F("stYear"), currentTimePart == year ? NEXTION_CYAN_COLOR : NEXTION_YELLOW_COLOR);
+  displaySetPco (F("stMonth"), currentTimePart == month ? NEXTION_CYAN_COLOR : NEXTION_YELLOW_COLOR);
+  displaySetPco (F("stDay"), currentTimePart == day ? NEXTION_CYAN_COLOR : NEXTION_YELLOW_COLOR);
+  displaySetPco (F("stHour"), currentTimePart == hour ? NEXTION_CYAN_COLOR : NEXTION_YELLOW_COLOR);
+  displaySetPco (F("stMinute"), currentTimePart == minute ? NEXTION_CYAN_COLOR : NEXTION_YELLOW_COLOR);
+  displaySetPco (F("stSecond"), currentTimePart == second ? NEXTION_CYAN_COLOR : NEXTION_YELLOW_COLOR);
+
+  String curVal;
+  switch (currentTimePart) {
+     case year :
+       curVal = F("year");
+       break;
+     case month :
+       curVal = F("month");
+       break;
+     case day :
+       curVal = F("day");
+       break;
+     case hour :
+       curVal = F("hour");
+       break;
+     case minute :
+       curVal = F("minute");
+       break;
+     case second :
+       curVal = F("second");
+       break;
+  }
+  displaySet (F("cur"), curVal);
+}
+
+// Add amount to current set time part
+void addCurrentSetTime (int amount) {
+  switch (currentTimePart) {
+     case year :
+       setTimeStruct.year += amount;
+       setTimeStruct.year = constrain (setTimeStruct.year, 2014, 2100);
+       break;
+     case month :
+       setTimeStruct.month += amount;
+       setTimeStruct.month = constrain (setTimeStruct.month, 1, 12);
+       break;
+     case day :
+       setTimeStruct.day += amount;
+       setTimeStruct.day = constrain (setTimeStruct.day, 1, 31);
+       break;
+     case hour :
+       setTimeStruct.hour += amount;
+       setTimeStruct.hour = constrain (setTimeStruct.hour, 0, 23);
+       break;
+     case minute :
+       setTimeStruct.minute += amount;
+       setTimeStruct.minute = constrain (setTimeStruct.minute, 0, 59);
+       break;
+     case second :
+       setTimeStruct.second += amount;
+       setTimeStruct.second = constrain (setTimeStruct.second, 0, 59);
+       break;
+  }
+}
+
+// Updates set time form
+void updateSetTimeForm() {
+  displaySet (F("stYear"), setTimeStruct.year);
+  displaySet (F("stMonth"), setTimeStruct.month);
+  displaySet (F("stDay"), setTimeStruct.day);
+  displaySet (F("stHour"), setTimeStruct.hour);
+  displaySet (F("stMinute"), setTimeStruct.minute);
+  displaySet (F("stSecond"), setTimeStruct.second);
+}
+
+// Updates RTC time
+void rtcSetTime() {
+  rtc.setYear (setTimeStruct.year - 2000);
+  rtc.setMonth (setTimeStruct.month);
+  rtc.setDate (setTimeStruct.day);
+  rtc.setHour (setTimeStruct.hour);
+  rtc.setMinute (setTimeStruct.minute);
+  rtc.setSecond (setTimeStruct.second);
+}
+
 // Handles display events.
 void handleDisplay() {
   while (display.available() > 0) {
@@ -504,6 +683,9 @@ void handleDisplay() {
         break;
       case 'D':
         serialTunnel();
+        break;
+      case 'w':
+        wifiAp();
         break;
       case 'H':
         switchPage (NEXTION_PAGE_MAIN);
@@ -520,6 +702,58 @@ void handleDisplay() {
       case 'T':
         switchPage (NEXTION_PAGE_TEMPERATURES);
         break;
+
+      case 't': {
+        if (displayedPage == NEXTION_PAGE_SETTIME) {
+          rtcSetTime();
+          switchPage (NEXTION_PAGE_MAIN);
+        } else {
+          if (!hasRtc) {
+            break;
+          }
+
+          currentTimePart = year;
+          DateTime now = RTClib::now();
+
+          setTimeStruct.year = now.year();
+          setTimeStruct.month = now.month();
+          setTimeStruct.day = now.day();
+          setTimeStruct.hour = now.hour();
+          setTimeStruct.minute = now.minute();
+          setTimeStruct.second = now.second();
+
+          switchPage (NEXTION_PAGE_SETTIME);
+          updateSetTimeForm();
+          updateSetTimePart();
+        }
+        break;
+      }
+
+      case '0' :
+        currentTimePart = year;
+        updateSetTimePart();
+        break;
+      case '1' :
+        currentTimePart = month;
+        updateSetTimePart();
+        break;
+      case '2' :
+        currentTimePart = day;
+        updateSetTimePart();
+        break;
+      case '3' :
+        currentTimePart = hour;
+        updateSetTimePart();
+        break;
+      case '4' :
+        currentTimePart = minute;
+        updateSetTimePart();
+        break;
+      case '5' :
+        currentTimePart = second;
+        updateSetTimePart();
+        break;
+
       case 'h':
         wd.mPedalsMode = GW_PEDALS_MODE_HARD;
         updatePedalsMode();
@@ -532,14 +766,26 @@ void handleDisplay() {
         wd.mPedalsMode = GW_PEDALS_MODE_SOFT;
         updatePedalsMode();
         break;
+
       case '+':
-        wd.mTiltbackSpeed = min (wd.mTiltbackSpeed + GW_SPEED_INCREMENT, 60);
-        updateTiltbackSpeed();
+        if (displayedPage == NEXTION_PAGE_SETTINGS) {
+          wd.mTiltbackSpeed = min (wd.mTiltbackSpeed + GW_SPEED_INCREMENT, 60);
+          updateTiltbackSpeed();
+        } else if (displayedPage == NEXTION_PAGE_SETTIME) {
+          addCurrentSetTime (1);
+          updateSetTimeForm();
+        }
         break;
       case '-':
-        wd.mTiltbackSpeed = max (wd.mTiltbackSpeed - GW_SPEED_INCREMENT, 0);
-        updateTiltbackSpeed();
+        if (displayedPage == NEXTION_PAGE_SETTINGS) {
+          wd.mTiltbackSpeed = max (wd.mTiltbackSpeed - GW_SPEED_INCREMENT, 0);
+          updateTiltbackSpeed();
+        } else if (displayedPage == NEXTION_PAGE_SETTIME) {
+          addCurrentSetTime (-1);
+          updateSetTimeForm();
+        }
         break;
+
       case 'S':
         switchPage (NEXTION_PAGE_SETTINGS);
         break;
@@ -547,14 +793,14 @@ void handleDisplay() {
         switchPage (NEXTION_PAGE_ERRORS);
         break;
       case 'b':
-        if (batteryCellMode == BatteryCellMode::resistances) {
-          batteryCellMode = BatteryCellMode::voltages;
+        if (batteryCellMode == resistances) {
+          batteryCellMode = voltages;
         } else {
-          batteryCellMode = BatteryCellMode::resistances;
+          batteryCellMode = resistances;
         }
         break;
       default:
-        Serial.printf("<< DISPLAY: %02x\n", val);
+        Serial.printf("<< DISPLAY: %02x\r\n", val);
         break;
     }
   }
@@ -577,6 +823,11 @@ void loop() {
   }
 
   handleDisplay();
+
+  DateTime currentTime;
+  if (hasRtc) {
+    currentTime = RTClib::now();
+  }
 
   if (connected) {
     switch (displayedPage) {
@@ -609,10 +860,17 @@ void loop() {
           }
         }
 
-        Serial.printf ("EUC: BV=%.2fV, BL=%d%%, PC=%.2fA, TEMP=%d°C, LOAD=%d%%, SPD=%dkm/h, DIST=%dm, TOT_DIST=%dkm\n", voltage, batteryLevel, phaseCurrent, temperature, load, speed, distance, totalDistance);
+        Serial.printf ("EUC: BV=%.2fV, BL=%d%%, PC=%.2fA, TEMP=%d°C, LOAD=%d%%, SPD=%dkm/h, DIST=%dm, TOT_DIST=%dkm\r\n", voltage, batteryLevel, phaseCurrent, temperature, load, speed, distance, totalDistance);
 
         if (!hasErrors) {
           displaySet (F("speed"), speed);
+
+          if (hasRtc) {
+            display.print(F("timeLabel.txt=\""));
+            display.printf ("%02d:%02d", currentTime.hour(), currentTime.minute());
+            display.print('"');
+            displayCommit();
+          }
         }
 
         displaySet (F("sch. "), F("kmSinceCharge"), distanceSinceCharge / 1000.0, 1, F("km"));
@@ -650,6 +908,10 @@ void loop() {
         display.print (wd.mLightMode == 0 ? NEXTION_II_LIGHT_OFF : NEXTION_II_LIGHT_ON);
         displayCommit();
 
+        display.print (F("sdImg.pic="));
+        display.print (SD_initialized() ? NEXTION_II_SD_ON : NEXTION_II_SD_OFF);
+        displayCommit();
+
         display.print (F("vis err,"));
         display.print (hasErrors ? 1 : 0);
         displayCommit();
@@ -667,7 +929,7 @@ void loop() {
         break;
       }
       case NEXTION_PAGE_BATTERY : {
-        Serial.printf ("BMS: CAP=%.0f%%, U=%.1fV, I=%.1fA, BAL_I=%.3f, T1=%.0f, T2=%.0f, T_BMS=%.0f, CYCLES=%d\n", bms.mPercentRemaining, bms.mTotalVoltage, bms.mCurrent, bms.mBalancingCurrent, bms.mTemperature1, bms.mTemperature2, bms.mBmsTemperature, bms.mChargeCycles);
+        Serial.printf ("BMS: CAP=%.0f%%, U=%.1fV, I=%.1fA, BAL_I=%.3f, T1=%.0f, T2=%.0f, T_BMS=%.0f, CYCLES=%d\r\n", bms.mPercentRemaining, bms.mTotalVoltage, bms.mCurrent, bms.mBalancingCurrent, bms.mTemperature1, bms.mTemperature2, bms.mBmsTemperature, bms.mChargeCycles);
 
         Serial.printf ("BMS: CELLS: MIN=%.3f, MAX=%.3f, AVG=%.3f, DELTA=%.3f, VOLTAGES: ", bms.mMinCellVoltage, bms.mMaxCellVoltage, bms.mAvgCellVoltage, bms.mDeltaCellVoltage);
         for (uint8_t i = 0; i < NUM_CELLS; i++) {
@@ -720,6 +982,8 @@ void loop() {
 
         displaySet (F("bmsTemp"), bms.mBmsTemperature, 0);
 
+        displaySet (F("dashTemp"), rtc.getTemperature(), 0);
+
         break;
       }
       case NEXTION_PAGE_SETTINGS : {
@@ -728,7 +992,23 @@ void loop() {
         displaySet (F("rHard"), wd.mPedalsMode == GW_PEDALS_MODE_HARD);
 
         displaySet (F("tiltbackSpeed"), wd.mTiltbackSpeed);
-        
+
+        if (lastDisplayedPage != displayedPage) {
+          uint64_t free, used;
+          int count;
+
+          SD_info (&used, &free, &count);
+
+          display.print(F("sdInfo.txt=\"SD: "));
+
+          display.print (count);
+          display.print (F(" files, "));
+          display.print (SD_file_size (free));
+          display.print (F(" free"));
+        }
+
+        display.print('"');
+        displayCommit();
         break;
       }
       case NEXTION_PAGE_TRIP : {
@@ -751,9 +1031,9 @@ void loop() {
 
         displaySet (F("maxChargePower"), ee.mMaxChargePower, 0, F("W"));
 
-        displaySet (F("rideTime"), timeToString (ee.mRideTime));
+        displaySet (F("rideTime"), timeToString (ee.mRideTime / 1000UL));
 
-        displaySet (F("totalRuntime"), timeToString (ee.mTotalRuntime));
+        displaySet (F("totalRuntime"), timeToString (ee.mTotalRuntime / 1000UL));
 
         break;
       }
@@ -818,9 +1098,15 @@ void loop() {
       ee.mTotalRuntime += (now - lastTotalRuntimeTime);
     }
     lastTotalRuntimeTime = now;
+
+    // Writing to the log
+    if ((displayedPage == NEXTION_PAGE_MAIN) && SD_initialized() && hasRtc && ((now - lastSDWrite) > SD_UPDATE_TIME)) {
+      writeDataToLog (currentTime);
+      lastSDWrite = now;
+    }
   }
 
-  // Kontrola zdali chodi pakety.
+  // Check if packets are going
   unsigned long now = millis();
 
   if ((lastEucPacketTime > 0UL) && (now - lastEucPacketTime > MAX_PACKET_TIME)) {
@@ -831,6 +1117,32 @@ void loop() {
   }
 
   delay(DISPLAY_UPDATE);
+}
+
+/*
+   Write CSV file with metrics.
+*/
+void writeDataToLog (DateTime time) {
+  char logLine [1024];
+  // HH:MM:SS;speed;euc_temp;euc_dist_since_charge;euc_phase_current;bms_voltage;bms_current;battery_level;bms_temp;bat1_temp;bat2_temp;bms_balance_cur;
+  sprintf (logLine, "%02d:%02d:%02d;%d;%ld;%ld;%.1f;%.1f;%.1f;%.0f;%.0f;%.0f;%.0f;%.3f;",
+    time.hour(),
+    time.minute(),
+    time.second(),
+    wd.mSpeed,
+    wd.mTemperature / 100,
+    ee.mDistanceLastCharge,
+    wd.mPhaseCurrent / 100.0,
+    bms.mTotalVoltage,
+    bms.mCurrent,
+    bms.mPercentRemaining,
+    bms.mBmsTemperature,
+    bms.mTemperature1,
+    bms.mTemperature2,
+    bms.mBalancingCurrent
+  );
+
+  SD_write_log (time, logLine);
 }
 
 /*
@@ -1043,6 +1355,31 @@ void serialTunnel() {
     if (display.available()) {
       Serial.write(display.read());
     }
+  }
+}
+
+// Create WiFi AP for SD card access.
+void wifiAp() {
+  if (pRemoteBmsCharacteristic) {
+    pRemoteBmsCharacteristic->registerForNotify(NULL);
+  }
+
+  if (pRemoteEucCharacteristic) {
+    pRemoteEucCharacteristic->registerForNotify(NULL);
+  }
+
+  SD_flush();
+
+  switchPage(NEXTION_PAGE_LOG);
+  clearScreen (false);
+  logLine(F("Starting WiFi access point..."));
+  SD_setup_wifi();
+  delay(1000);
+
+  switchPage(NEXTION_PAGE_WIFI);
+
+  while (true) {
+    SD_loop_wifi();
   }
 }
 
@@ -1357,3 +1694,4 @@ void processBms02Data (uint8_t* data, size_t length) {
 
   ee.mLastBatteryPercentRemaining = bms.mPercentRemaining;
 }
+

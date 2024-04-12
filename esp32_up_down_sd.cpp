@@ -1,0 +1,694 @@
+/**
+ * Emulates standard functions My Circuits 2022, based on code of David Bird 2018 
+ * using command mode of OpenLOG. More info in video:
+ *
+ * https://www.youtube.com/watch?v=zoYMU1tA3nI
+ *
+ * Configuration file /config.txt on SD card is expected with contents:
+ * 115200,26,1,2,1,1,0
+ *
+ * 115200 - Baudrate
+ * 26 - Escape character to return to command mode
+ * 1 - Escape character #
+ * 2 - Mode; initially command mode (2)
+ * 1 - Verbosity
+ * 1 - Echo
+ * 0 - Ignore RX 
+ *
+ * File name: esp32_up_down_sd.h
+ * Date:      2024/04/06 19:18
+ * Author:    ppet36
+*/
+
+#include <WiFi.h>
+#include <ESP32WebServer.h>    //https://github.com/Pedroalbuquerque/ESP32WebServer download and place in your Libraries folder
+#include <ESPmDNS.h>
+
+#include "CSS.h" //Includes headers of the web and de style file
+
+#include "esp32_up_down_sd.h"
+
+#define OPENLOG_BAUD 115200
+#define OPENLOG_RX 26
+#define OPENLOG_TX 25
+
+#define OPENLOG_ESC 26 // Ctrl+Z
+#define OPENLOG_TIMEOUT 3000
+#define OPENLOG_INPUT_PROMPT '>'
+#define OPENLOG_OUTPUT_PROMPT '<'
+
+// Webserver
+ESP32WebServer server(80);
+
+// OpenLOG connection
+#define openLog Serial1
+
+// Inidicates whether SD card is present
+bool SD_present = false;
+
+// Flag if append log file initiated.
+bool append_active = false;
+
+// Disk size in bytes
+uint64_t disk_size = 0;
+
+// Webpage creation space
+String webpage;
+
+// HH:MM:SS;speed;euc_temp;euc_dist_since_charge;euc_phase_current;bms_voltage;bms_current;battery_level;bms_temp;bat1_temp;bat2_temp;bms_balance_cur;
+const char CSV_HEADERS[] PROGMEM = "Time;Speed;EUC temp;EUC dist. since charge;EUC phase current;BMS voltage;BMS current;Battery level;BMS temp;Battery temp1;Battery temp2;BMS ballance current;";
+
+
+// External logging function which prints to serial and display.
+extern void logLine(String s);
+extern void log(String s);
+extern void logLine();
+
+
+// Wait for character with OPENLOG_TIMEOUT timeout.
+bool OL_wait_for_char (char ch, unsigned int offset = 0, char* payload = 0, size_t payload_size = 0) {
+  unsigned long t = millis();
+  off_t pos = 0;
+  int c;
+  int readed = 0;  
+
+  memset(payload, 0, payload_size);
+
+  Serial.print (F("Waiting for char \""));
+  Serial.print (ch);
+  Serial.print (F("\""));
+
+  while (millis() - t < OPENLOG_TIMEOUT) {
+    if (openLog.available()) {
+      c = openLog.read();
+
+      if (c == ch) {
+        Serial.print (F("\nChar found at position "));
+        Serial.println (pos);
+        return true;
+      }
+
+      readed++;
+
+      if (payload && (pos < payload_size) && (readed > offset)) {
+        payload[pos++] = c;
+      }
+    } else {
+      yield();
+    }
+  }
+
+  Serial.print (F("\nChar not found in timeout "));
+  Serial.println (OPENLOG_TIMEOUT);
+
+  return false;
+}
+
+bool OL_send_command (String command, char waitFor = OPENLOG_INPUT_PROMPT, char* payload = 0, size_t payload_size = 0) {
+  openLog.print(command);
+  openLog.write(13);
+  Serial.print(F("Sent command \""));
+  Serial.print(command);
+  Serial.println(F("\""));
+  if (OL_wait_for_char (waitFor, command.length(), payload, payload_size)) {
+    return true;
+  }
+  return false;
+}
+
+// Initialize connection to OpenLOG.
+void SD_setup(void) {
+  char diskInfo[512];
+
+  logLine(F("Initializing OpenLOG..."));
+
+  openLog.begin(OPENLOG_BAUD, SERIAL_8N1, OPENLOG_RX, OPENLOG_TX);
+
+  if (OL_send_command ("disk", OPENLOG_INPUT_PROMPT, diskInfo, sizeof(diskInfo))) {
+    Serial.print (diskInfo);
+
+    char* needle = strstr (diskInfo, "Card Size:");
+    if (needle) {
+      if (sscanf (needle, "Card Size: %u KB", &disk_size) == 1) {
+        disk_size *= (1024 * 1024);
+      }
+    }
+
+    log (F("Parsed disk size: "));
+    log (String(disk_size));
+    logLine (F(" bytes"));
+
+    SD_present = (disk_size > 0);
+  } else {
+    SD_present = false;
+    logLine (F("Failed to connect to OpenLOG..."));
+  }
+
+  log (F("SD_present is "));
+  logLine(String(SD_present));
+}
+
+void SD_setup_wifi(void) {  
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+  
+  //Set your preferred server name, if you use "mcserver" the address would be http://mcserver.local/
+  if (!MDNS.begin(servername)) {          
+    logLine(F("Error setting up MDNS responder!"));
+    delay (1000);
+    ESP.restart(); 
+  }
+  
+  /*********  Server Commands  **********/
+  server.on("/",         SD_dir);
+  server.on("/upload",   SD_file_upload);
+  server.on("/fupload",  HTTP_POST,[](){ server.send(200);}, SD_handle_file_upload);
+
+  server.begin();
+  
+  logLine("HTTP server started...");
+  delay(500);
+}
+
+/*********  LOOP  **********/
+
+void SD_loop_wifi(void) {
+  server.handleClient();
+}
+
+void SD_write_log (DateTime time, const char* value) {
+  if (SD_present) {
+    static uint8_t lastDay = time.day();
+
+    if (!append_active) {
+      char file_name [20];
+      char payload [32];
+      bool new_file = false;
+
+
+      sprintf (file_name, "/%04d%02d%02d.csv", time.year(), time.month(), time.day());
+      if (OL_send_command ("size " + String(file_name), OPENLOG_INPUT_PROMPT, payload, sizeof(payload))) {
+        int file_size = atoi (payload);
+        Serial.print (F("File "));
+        Serial.print (file_name);
+        Serial.print (F(" size is "));
+        Serial.print (file_size);
+        Serial.println (F(" bytes."));
+
+        new_file = (file_size < 0);
+      }
+
+      if (!OL_send_command ("append " + String(file_name), OPENLOG_OUTPUT_PROMPT)) {
+        SD_present = false;
+        return;
+      }
+
+      if (new_file) {
+        openLog.print (CSV_HEADERS);
+        openLog.println();
+      }
+
+      append_active = true;
+    } else if (lastDay != time.day()) {
+      if (SD_command_mode()) {
+        append_active = false;
+        lastDay = time.day();
+        SD_write_log (time, value);
+        return;
+      } else {
+        SD_present = false;
+        return;
+      }
+    }
+
+    openLog.print(value);
+    openLog.println();
+  }
+}
+
+bool SD_command_mode(void) {
+  unsigned long t = millis();
+  do {
+    Serial.println (F("Sending command mode character..."));
+    openLog.write (OPENLOG_ESC);
+    openLog.flush();
+    if (OL_wait_for_char(OPENLOG_INPUT_PROMPT)) {
+      Serial.println (F("Switched to command mode..."));
+      return true;
+    }
+    delay (250);
+  } while (millis() - t < OPENLOG_TIMEOUT * 3);
+
+  Serial.println (F("Cant switch to command mode!"));
+
+  return false;
+}
+
+void SD_flush(void) {
+  if (SD_present) {
+    if (append_active) {
+      Serial.println (F("Append active; swiching to command mode..."));
+      if (!SD_command_mode()) {
+        return;
+      }
+      append_active = false;
+    }
+
+    if (!OL_send_command ("sync")) {
+      SD_present = false;
+      return;
+    }
+  }
+}
+
+bool SD_initialized() {
+  return SD_present;
+}
+
+void SD_info(uint64_t* used_by_files, uint64_t* free, int* count_files) {
+  unsigned long t = millis();
+  char c;
+  char line [128];
+  char file_name [20];
+  unsigned int file_size;
+  off_t pos = 0;
+  uint64_t file_space = 0;
+
+  (* used_by_files) = 0;
+  (* free) = 0;
+  (* count_files) = 0;
+
+  if (!SD_present) {
+    return;
+  }
+
+  delay(500);
+  SD_flush();
+
+  memset(line, 0, sizeof(line));
+
+  openLog.print("ls");
+  openLog.write(13);
+
+  while (millis() - t < OPENLOG_TIMEOUT) {
+    if (openLog.available()) {
+      c = openLog.read();
+      if (c == OPENLOG_INPUT_PROMPT) {
+        break;
+      }
+
+      if (c == '\n') {
+        if (sscanf (line, "%s %u", file_name, &file_size) == 2) {
+          Serial.print (file_name);
+          Serial.print ('\t');
+          Serial.println (file_size);
+          (* used_by_files) += file_size;
+          (* count_files)++;
+        }
+
+        memset(line, 0, sizeof(line));
+        pos = 0;
+      }
+
+      line[pos++] = c;
+      if (pos >= sizeof(line)) {
+        break;
+      }
+    }
+  }
+
+  (* free) = disk_size - (* used_by_files);
+}
+
+uint64_t SD_disk_size() {
+  return disk_size;
+}
+
+/*********  FUNCTIONS  **********/
+//Initial page of the server web, list directory and give you the chance of deleting and uploading
+void SD_dir() {
+  if (SD_present) {
+    if (server.args() > 0) {
+      String order = server.arg(0);
+      Serial.print (F("Server arg[0] is "));
+      Serial.println (order);
+
+      if (order.indexOf("view_") >= 0) {
+        order.remove(0,5);
+        SD_file_download(order, "inline");
+        return;
+      }
+
+
+      if (order.indexOf("download_") >= 0) {
+        order.remove(0,9);
+        SD_file_download(order, "attachment");
+        return;
+      }
+  
+      if (order.indexOf("delete_") >= 0) {
+        order.remove(0,7);
+        SD_file_delete(order);
+        return;
+      }
+    }
+
+    SendHTML_Header();    
+    webpage += F("<table align='center'>");
+    webpage += F("<tr><th>Name</th><th>Size</th><th colspan='3'>Actions</th></tr>");
+    SD_print_directory();
+    webpage += F("</table>");
+    SendHTML_Content();
+    append_page_footer();
+    SendHTML_Content();
+    SendHTML_Stop();
+  } else {
+    ReportSDNotPresent();
+  }
+}
+
+//Upload a file to the SD
+void SD_file_upload() {
+  append_page_header();
+  webpage += F("<h3>Select File to Upload</h3>"); 
+  webpage += F("<FORM action='/fupload' method='post' enctype='multipart/form-data'>");
+  webpage += F("<input class='buttons' style='width:25%' type='file' name='fupload' id = 'fupload' value=''>");
+  webpage += F("<button class='buttons' style='width:10%' type='submit'>Upload File</button><br><br>");
+  webpage += F("<a href='/'>[Back]</a><br><br>");
+  append_page_footer();
+  server.send(200, "text/html",webpage);
+}
+
+//Prints the directory, it is called in void SD_dir() 
+void SD_print_directory() {
+  unsigned long t = millis();
+  char c;
+  char line [64];
+  char file_name [20];
+  unsigned int file_size;
+  off_t pos = 0;
+
+  SD_flush();
+
+  memset(line, 0, sizeof(line));
+
+  openLog.print("ls");
+  openLog.write(13);
+
+  while (millis() - t < OPENLOG_TIMEOUT) {
+    if (openLog.available()) {
+      c = openLog.read();
+      if (c == OPENLOG_INPUT_PROMPT) {
+        break;
+      }
+
+      if (c == '\n') {
+        if (sscanf (line, "%s %u", file_name, &file_size) == 2) {
+          if (webpage.length() > 1000) {
+            SendHTML_Content();
+          }
+
+          webpage += "<tr><td>" + String(file_name) + "</td>";
+          String fsize = SD_file_size (file_size);
+          webpage += "<td>" + fsize + "</td>";
+          webpage += "<td>";
+          webpage += F("<FORM action='/' method='post'>"); 
+          webpage += F("<button type='submit' name='view'"); 
+          webpage += F(" value='"); webpage += "view_" + String(file_name); webpage += F("'>View</button>");
+          webpage += "</td>";
+          webpage += "<td>";
+          webpage += F("<FORM action='/' method='post'>"); 
+          webpage += F("<button type='submit' name='download'"); 
+          webpage += F(" value='"); webpage += "download_" + String(file_name); webpage += F("'>Download</button>");
+          webpage += "</td>";
+          webpage += "<td>";
+          webpage += F("<FORM action='/' method='post'>"); 
+          webpage += F("<button type='submit' name='delete'"); 
+          webpage += F(" value='"); webpage += "delete_" + String(file_name); webpage += F("'>Delete</button>");
+          webpage += "</td>";
+          webpage += "</tr>";
+        }
+
+        memset(line, 0, sizeof(line));
+        pos = 0;
+      }
+
+      line[pos++] = c;
+      if (pos >= sizeof(line)) {
+        break;
+      }
+    }
+  }
+}
+
+//Download a file from the SD, it is called in void SD_dir()
+void SD_file_download (String filename, String content_disposition) {
+  unsigned long t;
+  char c;
+  unsigned int file_size;
+  char payload [32];
+
+  if (SD_present) {
+    Serial.print (F("Starting file "));
+    Serial.print (filename);
+    Serial.println (F(" download..."));
+    SD_flush();
+
+    if (OL_send_command ("size " + filename, OPENLOG_INPUT_PROMPT, payload, sizeof(payload))) {
+      file_size = atoi (payload);
+
+      Serial.print (F("File size is "));
+      Serial.print (file_size);
+      Serial.println (F("..."));
+
+      server.sendHeader("Content-Type", "text/plain");
+      server.sendHeader("Content-Disposition", content_disposition + "; filename="+filename);
+      server.sendHeader("Connection", "close");
+
+      server.setContentLength(file_size);
+      server.send(200, "text/plain", "");
+
+      char buffer [256];
+      unsigned int pos = 0;
+      size_t size = file_size;
+      
+      while (pos < size) {
+        unsigned int to_read = min ((unsigned int)80, (size - pos));
+
+        // Read block of file in HEX
+        String command = "read " + filename + " ";
+        command += String(pos);
+        command += " ";
+        command += String(to_read);
+        command += " 2";
+
+        if (OL_send_command(command, OPENLOG_INPUT_PROMPT, buffer, sizeof(buffer))) {
+          char hexBuff [3];
+          char decBuff [to_read];
+          uint8_t decBuffIndex = 0;
+          uint16_t bufferIndex = 0;
+
+          memset(hexBuff, 0, sizeof(hexBuff));
+
+          // Skip initial carriage returns
+          while (bufferIndex < to_read * 3) {
+            if (isprint (buffer[bufferIndex])) {
+              break;
+            }
+            bufferIndex++;
+          }
+
+          while (decBuffIndex < to_read) {
+            memcpy (hexBuff, &buffer[bufferIndex], 2);
+
+            char ch = (char) strtol(hexBuff, NULL, 16);
+
+            decBuff[decBuffIndex] = ch;
+            decBuffIndex++;
+
+            // 0x0A, 0x0D comes as single character
+            bufferIndex += (hexBuff[1] == ' ') ? 2 : 3;
+          }
+
+          Serial.println();
+          Serial.print (F("Converted "));
+          Serial.print (decBuffIndex);
+          Serial.println (F(" bytes."));
+
+          pos += to_read;
+
+          server.client().write(decBuff, to_read);
+
+          delay(10);
+        }
+      }
+
+      Serial.print(F("Transfered "));
+      Serial.print(pos);
+      Serial.println (F(" bytes."));
+    }
+  } else {
+    ReportSDNotPresent();
+  }
+}
+
+//Upload a new file to the Filing system
+void SD_handle_file_upload() {
+  HTTPUpload& uploadfile = server.upload(); //See https://github.com/esp8266/Arduino/tree/master/libraries/ESP8266WebServer/srcv
+                                            //For further information on 'status' structure, there are other reasons such as a failed transfer that could be used
+  if(uploadfile.status == UPLOAD_FILE_START) {
+    String filename = uploadfile.filename;
+    if(!filename.startsWith("/")) {
+      filename = "/" + filename;
+    }
+
+    Serial.print(F("Starting upload of file "));
+    Serial.println (filename);
+
+    OL_send_command ("rm " + filename);
+
+    openLog.print("append ");
+    openLog.print(filename);
+    openLog.write(13);
+    append_active = true;
+
+    filename = String();
+  } else if (uploadfile.status == UPLOAD_FILE_WRITE) {
+    openLog.write (uploadfile.buf, uploadfile.currentSize);
+    Serial.print (F("Written "));
+    Serial.print (uploadfile.currentSize);
+    Serial.println (F(" bytes."));
+  } else if (uploadfile.status == UPLOAD_FILE_END) {
+    SD_flush();
+
+    Serial.print (F("File "));
+    Serial.print (uploadfile.filename);
+    Serial.println (F(" successfully uploaded..."));
+
+    webpage = "";
+    append_page_header();
+    webpage += F("<h3>File was successfully uploaded</h3>"); 
+    webpage += F("<h2>Uploaded File Name: "); webpage += uploadfile.filename+"</h2>";
+    webpage += F("<h2>File Size: "); webpage += SD_file_size(uploadfile.totalSize) + "</h2><br><br>"; 
+    webpage += F("<a href='/'>[Back]</a><br><br>");
+    append_page_footer();
+
+    server.send(200,"text/html",webpage);
+  } else {
+    ReportCouldNotCreateFile("upload");
+  }
+}
+
+//Delete a file from the SD, it is called in void SD_dir()
+void SD_file_delete(String filename) { 
+  if (SD_present) { 
+    SendHTML_Header();
+
+    SD_flush();
+
+    if (OL_send_command ("rm " + filename)) {
+      webpage += "<h3>File '"+filename+"' has been deleted</h3>"; 
+      webpage += F("<a href='/'>[Back]</a><br><br>");
+    } else { 
+      webpage += F("<h3>File was not deleted - error</h3>");
+      webpage += F("<a href='/'>[Back]</a><br><br>");
+    }
+
+    append_page_footer(); 
+    SendHTML_Content();
+    SendHTML_Stop();
+  } else {
+    ReportSDNotPresent();
+  }
+} 
+
+//SendHTML_Header
+void SendHTML_Header() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate"); 
+  server.sendHeader("Pragma", "no-cache"); 
+  server.sendHeader("Expires", "-1"); 
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN); 
+  server.send(200, "text/html", ""); //Empty content inhibits Content-length header so we have to close the socket ourselves. 
+  append_page_header();
+  server.sendContent(webpage);
+  webpage = "";
+}
+
+//SendHTML_Content
+void SendHTML_Content() {
+  server.sendContent(webpage);
+  webpage = "";
+}
+
+//SendHTML_Stop
+void SendHTML_Stop() {
+  server.sendContent("");
+  server.client().stop(); //Stop is needed because no content length was sent
+}
+
+//ReportSDNotPresent
+void ReportSDNotPresent() {
+  SendHTML_Header();
+  webpage += F("<h3>No SD Card present</h3>"); 
+  webpage += F("<a href='/'>[Back]</a><br><br>");
+  append_page_footer();
+  SendHTML_Content();
+  SendHTML_Stop();
+}
+
+//ReportCouldNotCreateFile
+void ReportCouldNotCreateFile(String target) {
+  SendHTML_Header();
+  webpage += F("<h3>Could Not Create Uploaded File</h3>"); 
+  webpage += F("<a href='/"); webpage += target + "'>[Back]</a><br><br>";
+  append_page_footer();
+  SendHTML_Content();
+  SendHTML_Stop();
+}
+
+//File size conversion
+String SD_file_size(uint64_t bytes) {
+  String fsize = "";
+  if (bytes < 1024)                 fsize = String(bytes)+" B";
+  else if(bytes < (1024*1024))      fsize = String(bytes/1024.0,3)+" KB";
+  else if(bytes < (1024*1024*1024)) fsize = String(bytes/1024.0/1024.0,3)+" MB";
+  else                              fsize = String(bytes/1024.0/1024.0/1024.0,3)+" GB";
+  return fsize;
+}
+
+void append_page_header() {
+  webpage  = F("<!DOCTYPE html><html>");
+  webpage += F("<head>");
+  webpage += F("<title>EUC Server</title>");
+  webpage += F("<meta name='viewport' content='user-scalable=yes,initial-scale=1.0,width=device-width'>");
+  webpage += F("<style>");
+  webpage += F("body{max-width:65%;margin:0 auto;font-family:arial;font-size:100%;}");
+  webpage += F("ul{list-style-type:none;padding:0;border-radius:0em;overflow:hidden;background-color:#d90707;font-size:1em;}");
+  webpage += F("li{float:left;border-radius:0em;border-right:0em solid #bbb;}");
+  webpage += F("li a{color:white; display: block;border-radius:0.375em;padding:0.44em 0.44em;text-decoration:none;font-size:100%}");
+  webpage += F("li a:hover{background-color:#e86b6b;border-radius:0em;font-size:100%}");
+  webpage += F("h1{color:white;border-radius:0em;font-size:1.5em;padding:0.2em 0.2em;background:#d90707;}");
+  webpage += F("h2{color:blue;font-size:0.8em;}");
+  webpage += F("h3{font-size:0.8em;}");
+  webpage += F("table{font-family:arial,sans-serif;font-size:0.9em;border-collapse:collapse;width:85%;}"); 
+  webpage += F("th,td {border:0.06em solid #dddddd;text-align:left;padding:0.3em;border-bottom:0.06em solid #dddddd;}"); 
+  webpage += F("tr:nth-child(odd) {background-color:#eeeeee;}");
+  webpage += F(".rcorners_n {border-radius:0.5em;background:#558ED5;padding:0.3em 0.3em;width:20%;color:white;font-size:75%;}");
+  webpage += F(".rcorners_m {border-radius:0.5em;background:#558ED5;padding:0.3em 0.3em;width:50%;color:white;font-size:75%;}");
+  webpage += F(".rcorners_w {border-radius:0.5em;background:#558ED5;padding:0.3em 0.3em;width:70%;color:white;font-size:75%;}");
+  webpage += F(".column{float:left;width:50%;height:45%;}");
+  webpage += F(".row:after{content:'';display:table;clear:both;}");
+  webpage += F("*{box-sizing:border-box;}");
+  webpage += F("a{font-size:75%;}");
+  webpage += F("p{font-size:75%;}");
+  webpage += F("</style></head><body><h1>EUC SD server</h1>");
+  webpage += F("<ul>");
+  webpage += F("<li><a href='/'>Files</a></li>");
+  webpage += F("<li><a href='/upload'>Upload</a></li>"); 
+  webpage += F("</ul>");
+}
+
+//Saves repeating many lines of code for HTML page footers
+void append_page_footer() { 
+  webpage += F("</body></html>");
+}
+
