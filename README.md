@@ -12,3 +12,6 @@ The dashboard is attached to the EUC frame with Velcro. It is only powered from 
 
 The video of the older version is on YouTube [Test of EUC dashboard](https://youtu.be/FmaS4RxT6nU). The latest version is not on the video. In the latest version, it is also possible to modify some EUC parameters such as tiltback speed and pedal mode.
 
+## Update 2024-04-12
+I added support for RTC (DS3231) and SD card metadata logging via OpenLOG. You can connect to the dashboard via WiFi and download logs from the SD card.
+
