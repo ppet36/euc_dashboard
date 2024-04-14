@@ -628,7 +628,7 @@ void addCurrentSetTime (int amount) {
   switch (currentTimePart) {
      case year :
        setTimeStruct.year += amount;
-       setTimeStruct.year = constrain (setTimeStruct.year, 2014, 2100);
+       setTimeStruct.year = constrain (setTimeStruct.year, 2024, 2100);
        break;
      case month :
        setTimeStruct.month += amount;
@@ -868,6 +868,11 @@ void loop() {
           if (hasRtc) {
             display.print(F("timeLabel.txt=\""));
             display.printf ("%02d:%02d", currentTime.hour(), currentTime.minute());
+            display.print('"');
+            displayCommit();
+
+            display.print(F("dateLabel.txt=\""));
+            display.printf ("%04d-%02d-%02d", currentTime.year(), currentTime.month(), currentTime.day());
             display.print('"');
             displayCommit();
           }
@@ -1347,13 +1352,14 @@ void serialTunnel() {
   switchPage (NEXTION_PAGE_TUNNEL);
   delay(1000);
 
+  SD_command_mode();
   while (true) {
     if (Serial.available()) {
-      display.write(Serial.read());
+      Serial1.write(Serial.read());
     }
 
-    if (display.available()) {
-      Serial.write(display.read());
+    if (Serial1.available()) {
+      Serial.write(Serial1.read());
     }
   }
 }

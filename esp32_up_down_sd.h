@@ -35,6 +35,7 @@ bool SD_command_mode(void);
 void SD_write_log (DateTime time, const char* value);
 void SD_flush(void);
 bool SD_initialized();
+void OL_reset(void);
 
 #endif
 
