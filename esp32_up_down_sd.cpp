@@ -185,7 +185,7 @@ void SD_setup(void) {
   logLine(String(SD_present));
 }
 
-void SD_setup_wifi(void) {  
+void SD_setup_wifi(void) {
   WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
   
   //Set your preferred server name, if you use "mcserver" the address would be http://mcserver.local/
@@ -503,7 +503,7 @@ void SD_file_upload() {
 void SD_print_directory() {
   unsigned long t = millis();
   char c;
-  char line [64];
+  char line [128];
   char file_name [20];
   char display_name [20];
   char payload [32];
@@ -517,6 +517,7 @@ void SD_print_directory() {
   memset(line, 0, sizeof(line));
 
   OL_empty_queue();
+
   openLog.print("ls");
   openLog.write(13);
 
@@ -539,45 +540,44 @@ void SD_print_directory() {
           int y = 0, m = 0, d = 0, part = 0;
           int scanned = sscanf (file_name, "%04d%02d%02d.%03d", &y, &m, &d, &part);
 
-          if (scanned == 4) {
-            continue;
-          } else if (scanned == 3) {
+          if (scanned == 3) {
             sprintf (display_name, "%04d-%02d-%02d", y, m, d);
             fsize = "-";
             lazyInitSizes += String(file_name) + ",";
           }
 
-          webpage += "<tr><td>" + String(display_name) + "</td>";
-          webpage += "<td id='fs" + String(file_name) + "'>" + fsize + "</td>";
-          webpage += "<td>";
-          webpage += F("<FORM action='/' method='post'>"); 
-          webpage += F("<button type='submit' name='view'"); 
-          webpage += F(" value='"); webpage += "view_" + String(file_name); webpage += F("'>View</button>");
-          webpage += "</td>";
-          webpage += "<td>";
-          webpage += F("<FORM action='/' method='post'>"); 
-          webpage += F("<button type='submit' name='download'"); 
-          webpage += F(" value='"); webpage += "download_" + String(file_name); webpage += F("'>Download</button>");
-          webpage += "</td>";
-          webpage += "<td>";
-          webpage += F("<FORM action='/' method='post'>"); 
-          webpage += F("<button type='submit' name='delete'"); 
-          webpage += F(" value='"); webpage += "delete_" + String(file_name); webpage += F("'>Delete</button>");
-          webpage += "</td>";
-          webpage += "</tr>";
-        }
+          if (scanned != 4) {
+            webpage += "<tr><td>" + String(display_name) + "</td>";
+            webpage += "<td id='fs" + String(file_name) + "'>" + fsize + "</td>";
+            webpage += "<td>";
+            webpage += F("<FORM action='/' method='post'>"); 
+            webpage += F("<button type='submit' name='view'");
+            webpage += F(" value='"); webpage += "view_" + String(file_name); webpage += F("'>View</button>");
+            webpage += "</td>";
+            webpage += "<td>";
+            webpage += F("<FORM action='/' method='post'>"); 
+            webpage += F("<button type='submit' name='download'"); 
+            webpage += F(" value='"); webpage += "download_" + String(file_name); webpage += F("'>Download</button>");
+            webpage += "</td>";
+            webpage += "<td>";
+            webpage += F("<FORM action='/' method='post'>"); 
+            webpage += F("<button type='submit' name='delete'");
+            webpage += F(" value='"); webpage += "delete_" + String(file_name); webpage += F("'>Delete</button>");
+            webpage += "</td>";
+            webpage += "</tr>";
+          }
+        }   
 
         memset(line, 0, sizeof(line));
         pos = 0;
-      }
+      }     
 
-      line[pos++] = c;
+      line [pos++] = c;
       if (pos >= sizeof(line)) {
         break;
-      }
-    }
-  }
-
+      }     
+    }       
+  }         
 
   webpage += "<script>";
 
