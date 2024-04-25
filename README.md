@@ -15,3 +15,9 @@ The video of the older version is on YouTube [Test of EUC dashboard](https://you
 ## Update 2024-04-12
 I added support for RTC (DS3231) and SD card metadata logging via OpenLOG. You can connect to the dashboard via WiFi and download logs from the SD card.
 
+## Update 2024-04-25
+I added the Neo6M GPS module + coordinate and altitude logging to the metadata. Current view inside:
+
+![alt](/images/dash_int_current.jpg?raw=true)
+
+

@@ -12,6 +12,8 @@
 #include <EEPROM.h>
 #include <Wire.h>
 #include <DS3231.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS.h>
 #include "esp32_up_down_sd.h"
 
 // Frequency of display update.
@@ -55,12 +57,15 @@
 #define NEXTION_PAGE_ERRORS 8
 #define NEXTION_PAGE_WIFI 9
 #define NEXTION_PAGE_SETTIME 10
+#define NEXTION_PAGE_GPS 11
 
 // Image indexes
 #define NEXTION_II_LIGHT_OFF 9
 #define NEXTION_II_LIGHT_ON 10
 #define NEXTION_II_SD_OFF 20
 #define NEXTION_II_SD_ON 21
+#define NEXTION_II_GPS_ON 22
+#define NEXTION_II_GPS_OFF 23
 
 // Gotway pedals mode
 #define GW_PEDALS_MODE_HARD 2
@@ -81,6 +86,10 @@
 #define BMS_MAX_PACKET_SIZE 320
 #define EUC_MAX_PACKET_SIZE 24
 
+// GPS
+#define GPS_RX 32
+#define GPS_TX 33
+#define GPS_MAX_AGE 15000UL // 15s
 
 // BLE services; they are the same for BMS and EUC, however, in principle, they are declared separately.
 static BLEUUID serviceUUID_EUC("0000ffe0-0000-1000-8000-00805f9b34fb");
@@ -213,6 +222,7 @@ UnpackerData bmsUnpacker;
 
 // Display state.
 String curDisplayLine = "";
+unsigned long lastDisplayUpdate = 0;
 uint8_t curDisplayRow = 0;
 uint8_t displayedPage = 0;
 uint8_t lastDisplayedPage = 0xFF;
@@ -232,6 +242,10 @@ unsigned long lastRideTime = 0UL;
 unsigned long lastTotalRuntimeTime = 0UL;
 // Last write to SD card
 unsigned long lastSDWrite = 0UL;
+
+// GPS
+SoftwareSerial gpsSerial (GPS_RX, GPS_TX);
+TinyGPS gps;
 
 // BMS errors
 #define BMS_ERRORS_SIZE 16
@@ -364,6 +378,7 @@ class EucAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 void setup() {
   Serial.begin(115200);
   display.begin(115200);
+  gpsSerial.begin(9600);
 
   delay(2000);
 
@@ -799,6 +814,9 @@ void handleDisplay() {
           batteryCellMode = resistances;
         }
         break;
+      case 'g' :
+        switchPage(NEXTION_PAGE_GPS);
+        break;
       default:
         Serial.printf("<< DISPLAY: %02x\r\n", val);
         break;
@@ -830,258 +848,304 @@ void loop() {
   }
 
   if (connected) {
-    switch (displayedPage) {
-      case NEXTION_PAGE_MAIN : {
-        double voltage = bms.mTotalVoltage;
-        uint16_t speed = wd.mSpeed;
-        uint32_t totalDistance = (uint32_t)round(wd.mTotalDistance / 1000.0);
-        double phaseCurrent = wd.mPhaseCurrent / 100.0;
-        int16_t temperature = wd.mTemperature / 100;
-        uint16_t batteryLevel = bms.mPercentRemaining;
-        uint32_t distanceSinceCharge = ee.mDistanceLastCharge;
-        uint32_t distance = ee.mDistance;
+    unsigned long now = millis();
 
-        bool charging = (bms.mCurrent > 0);
+    if ((now - lastDisplayUpdate) > DISPLAY_UPDATE) {
+      lastDisplayUpdate = now;
+      switch (displayedPage) {
+        case NEXTION_PAGE_MAIN : {
+          double voltage = bms.mTotalVoltage;
+          uint16_t speed = wd.mSpeed;
+          uint32_t totalDistance = (uint32_t)round(wd.mTotalDistance / 1000.0);
+          double phaseCurrent = wd.mPhaseCurrent / 100.0;
+          int16_t temperature = wd.mTemperature / 100;
+          uint16_t batteryLevel = bms.mPercentRemaining;
+          uint32_t distanceSinceCharge = ee.mDistanceLastCharge;
+          uint32_t distance = ee.mDistance;
 
-        bool hasErrors = bms.mErrors || wd.mErrors;
+          bool charging = (bms.mCurrent > 0);
 
-        int power, load;
-        if (charging) {
-          power = constrain ((int) round (voltage * bms.mCurrent), 0, EUC_MAX_CHG_POWER);
-          load = map (power, 0, EUC_MAX_CHG_POWER, 0, 100);
-          if (power > ee.mMaxChargePower) {
-            ee.mMaxChargePower = power;
-          }
-        } else {
-          power = constrain ((int) abs (round(voltage * bms.mCurrent)), 0, EUC_MAX_POWER);
-          load = -1 * map (power, 0, EUC_MAX_POWER, 0, 100);
-          if (power > ee.mMaxPower) {
-            ee.mMaxPower = power;
-          }
-        }
+          bool hasErrors = bms.mErrors || wd.mErrors;
 
-        Serial.printf ("EUC: BV=%.2fV, BL=%d%%, PC=%.2fA, TEMP=%d°C, LOAD=%d%%, SPD=%dkm/h, DIST=%dm, TOT_DIST=%dkm\r\n", voltage, batteryLevel, phaseCurrent, temperature, load, speed, distance, totalDistance);
-
-        if (!hasErrors) {
-          displaySet (F("speed"), speed);
-
-          if (hasRtc) {
-            display.print(F("timeLabel.txt=\""));
-            display.printf ("%02d:%02d", currentTime.hour(), currentTime.minute());
-            display.print('"');
-            displayCommit();
-
-            display.print(F("dateLabel.txt=\""));
-            display.printf ("%04d-%02d-%02d", currentTime.year(), currentTime.month(), currentTime.day());
-            display.print('"');
-            displayCommit();
-          }
-        }
-
-        displaySet (F("sch. "), F("kmSinceCharge"), distanceSinceCharge / 1000.0, 1, F("km"));
-
-        displaySet (F("batPercent"), batteryLevel);
-
-        displaySet (F("batVolt"), voltage, 1, F("V"));
-
-        displaySet (F("temp"), temperature);
-
-        displaySet (F("pwm"), load);
-
-        display.print(F("km.txt=\""));
-        if (charging) {
-          display.print (F("C:"));
-          display.print (power);
-          display.print ('W');
-        } else {
-          if (distance < 1000) {
-            display.print(distance);
-            display.print('m');
+          int power, load;
+          if (charging) {
+            power = constrain ((int) round (voltage * bms.mCurrent), 0, EUC_MAX_CHG_POWER);
+            load = map (power, 0, EUC_MAX_CHG_POWER, 0, 100);
+            if (power > ee.mMaxChargePower) {
+              ee.mMaxChargePower = power;
+            }
           } else {
-            display.print(distance / 1000.0, 1);
-            display.print(F("km"));
+            power = constrain ((int) abs (round(voltage * bms.mCurrent)), 0, EUC_MAX_POWER);
+            load = -1 * map (power, 0, EUC_MAX_POWER, 0, 100);
+            if (power > ee.mMaxPower) {
+              ee.mMaxPower = power;
+            }
           }
-        }
-        display.print('"');
-        displayCommit();
 
-        displaySetPco (F("km"), charging ? NEXTION_GREEN_COLOR : NEXTION_YELLOW_COLOR);
+          Serial.printf ("EUC: BV=%.2fV, BL=%d%%, PC=%.2fA, TEMP=%d°C, LOAD=%d%%, SPD=%dkm/h, DIST=%dm, TOT_DIST=%dkm\r\n", voltage, batteryLevel, phaseCurrent, temperature, load, speed, distance, totalDistance);
 
-        displaySet (F("total "), F("totalKm"), String(totalDistance), F("km"));
+          if (!hasErrors) {
+            displaySet (F("speed"), speed);
 
-        display.print (F("light.pic="));
-        display.print (wd.mLightMode == 0 ? NEXTION_II_LIGHT_OFF : NEXTION_II_LIGHT_ON);
-        displayCommit();
+            if (hasRtc) {
+              display.print(F("timeLabel.txt=\""));
+              display.printf ("%02d:%02d", currentTime.hour(), currentTime.minute());
+              display.print('"');
+              displayCommit();
 
-        display.print (F("sdImg.pic="));
-        display.print (SD_initialized() ? NEXTION_II_SD_ON : NEXTION_II_SD_OFF);
-        displayCommit();
-
-        display.print (F("vis err,"));
-        display.print (hasErrors ? 1 : 0);
-        displayCommit();
-        if (hasErrors) {
-          String s = "";
-          if (bms.mErrors) {
-            s += F("BMS ERRORS\r");
+              display.print(F("dateLabel.txt=\""));
+              display.printf ("%04d-%02d-%02d", currentTime.year(), currentTime.month(), currentTime.day());
+              display.print('"');
+              displayCommit();
+            }
           }
-          if (wd.mErrors) {
-            s += F("EUC ERRORS\r");
+
+          displaySet (F("sch. "), F("kmSinceCharge"), distanceSinceCharge / 1000.0, 1, F("km"));
+
+          displaySet (F("batPercent"), batteryLevel);
+
+          displaySet (F("batVolt"), voltage, 1, F("V"));
+
+          displaySet (F("temp"), temperature);
+
+          displaySet (F("pwm"), load);
+
+          display.print(F("km.txt=\""));
+          if (charging) {
+            display.print (F("C:"));
+            display.print (power);
+            display.print ('W');
+          } else {
+            if (distance < 1000) {
+              display.print(distance);
+              display.print('m');
+            } else {
+              display.print(distance / 1000.0, 1);
+              display.print(F("km"));
+            }
           }
-          displaySet (F("err"), s);
-        }
+          display.print('"');
+          displayCommit();
 
-        break;
-      }
-      case NEXTION_PAGE_BATTERY : {
-        Serial.printf ("BMS: CAP=%.0f%%, U=%.1fV, I=%.1fA, BAL_I=%.3f, T1=%.0f, T2=%.0f, T_BMS=%.0f, CYCLES=%d\r\n", bms.mPercentRemaining, bms.mTotalVoltage, bms.mCurrent, bms.mBalancingCurrent, bms.mTemperature1, bms.mTemperature2, bms.mBmsTemperature, bms.mChargeCycles);
+          displaySetPco (F("km"), charging ? NEXTION_GREEN_COLOR : NEXTION_YELLOW_COLOR);
 
-        Serial.printf ("BMS: CELLS: MIN=%.3f, MAX=%.3f, AVG=%.3f, DELTA=%.3f, VOLTAGES: ", bms.mMinCellVoltage, bms.mMaxCellVoltage, bms.mAvgCellVoltage, bms.mDeltaCellVoltage);
-        for (uint8_t i = 0; i < NUM_CELLS; i++) {
-          Serial.print (bms.mCellVoltages[i], 3);
-          if (i < NUM_CELLS - 1) {
-            Serial.print (F(", "));
+          displaySet (F("total "), F("totalKm"), String(totalDistance), F("km"));
+
+          display.print (F("light.pic="));
+          display.print (wd.mLightMode == 0 ? NEXTION_II_LIGHT_OFF : NEXTION_II_LIGHT_ON);
+          displayCommit();
+
+          display.print (F("sdImg.pic="));
+          display.print (SD_initialized() ? NEXTION_II_SD_ON : NEXTION_II_SD_OFF);
+          displayCommit();
+
+          long lat, lon;
+          unsigned long age;
+          gps.get_position(&lat, &lon, &age);
+
+          display.print(F("gpsImg.pic="));
+          display.print (((age > GPS_MAX_AGE) || (lat == TinyGPS::GPS_INVALID_ANGLE) || (lon == TinyGPS::GPS_INVALID_ANGLE)) ? NEXTION_II_GPS_OFF : NEXTION_II_GPS_ON);
+          displayCommit();
+
+          display.print (F("vis err,"));
+          display.print (hasErrors ? 1 : 0);
+          displayCommit();
+          if (hasErrors) {
+            String s = "";
+            if (bms.mErrors) {
+              s += F("BMS ERRORS\r");
+            }
+            if (wd.mErrors) {
+              s += F("EUC ERRORS\r");
+            }
+            displaySet (F("err"), s);
           }
-        }
-        Serial.println();
 
-        Serial.print (F("BMS: CELLS: RESISTANCES: "));
-        for (uint8_t i = 0; i < NUM_CELLS; i++) {
-          Serial.print (bms.mCellResistances[i], 3);
-          if (i < NUM_CELLS - 1) {
-            Serial.print (F(", "));
+          break;
+        }
+        case NEXTION_PAGE_BATTERY : {
+          Serial.printf ("BMS: CAP=%.0f%%, U=%.1fV, I=%.1fA, BAL_I=%.3f, T1=%.0f, T2=%.0f, T_BMS=%.0f, CYCLES=%d\r\n", bms.mPercentRemaining, bms.mTotalVoltage, bms.mCurrent, bms.mBalancingCurrent, bms.mTemperature1, bms.mTemperature2, bms.mBmsTemperature, bms.mChargeCycles);
+
+          Serial.printf ("BMS: CELLS: MIN=%.3f, MAX=%.3f, AVG=%.3f, DELTA=%.3f, VOLTAGES: ", bms.mMinCellVoltage, bms.mMaxCellVoltage, bms.mAvgCellVoltage, bms.mDeltaCellVoltage);
+          for (uint8_t i = 0; i < NUM_CELLS; i++) {
+            Serial.print (bms.mCellVoltages[i], 3);
+            if (i < NUM_CELLS - 1) {
+              Serial.print (F(", "));
+            }
           }
+          Serial.println();
+
+          Serial.print (F("BMS: CELLS: RESISTANCES: "));
+          for (uint8_t i = 0; i < NUM_CELLS; i++) {
+            Serial.print (bms.mCellResistances[i], 3);
+            if (i < NUM_CELLS - 1) {
+              Serial.print (F(", "));
+            }
+          }
+          Serial.println();
+
+          display.print (F("batInfo1.txt=\""));
+          display.printf ("U: %.1fV | I: %.1fA | BI: %.3fA | CY: %d\"", bms.mTotalVoltage, bms.mCurrent, bms.mBalancingCurrent, bms.mChargeCycles);
+          displayCommit();
+
+          display.print (F("batInfo2.txt=\""));
+          display.printf ("BT1: %.0fC | BT2: %.0fC | BMST: %.0fC\"", bms.mTemperature1, bms.mTemperature2, bms.mBmsTemperature);
+          displayCommit();
+
+          displaySet (F("batMin"), bms.mMinCellVoltage, 3);
+
+          displaySet (F("batMax"), bms.mMaxCellVoltage, 3);
+
+          displaySet (F("batAvg"), bms.mAvgCellVoltage, 3);
+
+          displaySet (F("batDiff"), bms.mDeltaCellVoltage, 3);
+
+          displaySet (F("cellsCapt"), (batteryCellMode == BatteryCellMode::voltages) ? F("Voltages:") : F("Resistances:"));
+
+          for (uint8_t i = 0; i < NUM_CELLS; i++) {
+            displayBatteryCell (i);
+          }
+
+          break;
         }
-        Serial.println();
+        case NEXTION_PAGE_TEMPERATURES : {
+          displaySet (F("eucTemp"), round (wd.mTemperature / 100.0), 0);
 
-        display.print (F("batInfo1.txt=\""));
-        display.printf ("U: %.1fV | I: %.1fA | BI: %.3fA | CY: %d\"", bms.mTotalVoltage, bms.mCurrent, bms.mBalancingCurrent, bms.mChargeCycles);
-        displayCommit();
+          displaySet (F("batTemp1"), bms.mTemperature1, 0);
 
-        display.print (F("batInfo2.txt=\""));
-        display.printf ("BT1: %.0fC | BT2: %.0fC | BMST: %.0fC\"", bms.mTemperature1, bms.mTemperature2, bms.mBmsTemperature);
-        displayCommit();
+          displaySet (F("batTemp2"), bms.mTemperature2, 0);
 
-        displaySet (F("batMin"), bms.mMinCellVoltage, 3);
+          displaySet (F("bmsTemp"), bms.mBmsTemperature, 0);
 
-        displaySet (F("batMax"), bms.mMaxCellVoltage, 3);
+          displaySet (F("dashTemp"), rtc.getTemperature(), 0);
 
-        displaySet (F("batAvg"), bms.mAvgCellVoltage, 3);
-
-        displaySet (F("batDiff"), bms.mDeltaCellVoltage, 3);
-
-        displaySet (F("cellsCapt"), (batteryCellMode == BatteryCellMode::voltages) ? F("Voltages:") : F("Resistances:"));
-
-        for (uint8_t i = 0; i < NUM_CELLS; i++) {
-          displayBatteryCell (i);
+          break;
         }
+        case NEXTION_PAGE_SETTINGS : {
+          displaySet (F("rSoft"), wd.mPedalsMode == GW_PEDALS_MODE_SOFT);
+          displaySet (F("rMedium"), wd.mPedalsMode == GW_PEDALS_MODE_MEDIUM);
+          displaySet (F("rHard"), wd.mPedalsMode == GW_PEDALS_MODE_HARD);
 
-        break;
-      }
-      case NEXTION_PAGE_TEMPERATURES : {
-        displaySet (F("eucTemp"), round (wd.mTemperature / 100.0), 0);
+          displaySet (F("tiltbackSpeed"), wd.mTiltbackSpeed);
 
-        displaySet (F("batTemp1"), bms.mTemperature1, 0);
+          if (lastDisplayedPage != displayedPage) {
+            uint64_t free, used;
+            int count;
 
-        displaySet (F("batTemp2"), bms.mTemperature2, 0);
+            SD_info (&used, &free, &count);
 
-        displaySet (F("bmsTemp"), bms.mBmsTemperature, 0);
+            display.print(F("sdInfo.txt=\"SD: "));
 
-        displaySet (F("dashTemp"), rtc.getTemperature(), 0);
+            display.print (count);
+            display.print (F(" files, "));
+            display.print (SD_file_size (free));
+            display.print (F(" free"));
+          }
 
-        break;
-      }
-      case NEXTION_PAGE_SETTINGS : {
-        displaySet (F("rSoft"), wd.mPedalsMode == GW_PEDALS_MODE_SOFT);
-        displaySet (F("rMedium"), wd.mPedalsMode == GW_PEDALS_MODE_MEDIUM);
-        displaySet (F("rHard"), wd.mPedalsMode == GW_PEDALS_MODE_HARD);
-
-        displaySet (F("tiltbackSpeed"), wd.mTiltbackSpeed);
-
-        if (lastDisplayedPage != displayedPage) {
-          uint64_t free, used;
-          int count;
-
-          SD_info (&used, &free, &count);
-
-          display.print(F("sdInfo.txt=\"SD: "));
-
-          display.print (count);
-          display.print (F(" files, "));
-          display.print (SD_file_size (free));
-          display.print (F(" free"));
+          display.print('"');
+          displayCommit();
+          break;
         }
+        case NEXTION_PAGE_TRIP : {
+          displaySet (F("maxSpeed"), ee.mTopSpeed, 0, F("km/h"));
 
-        display.print('"');
-        displayCommit();
-        break;
-      }
-      case NEXTION_PAGE_TRIP : {
-        displaySet (F("maxSpeed"), ee.mTopSpeed, 0, F("km/h"));
+          double avgSpeed = 0;
+          if (ee.mRideTime > 0) {
+            avgSpeed = ((double)ee.mDistance / 1000.0) / (ee.mRideTime / 1000.0 / 3600.0);
+          }
 
-        double avgSpeed = 0;
-        if (ee.mRideTime > 0) {
-          avgSpeed = ((double)ee.mDistance / 1000.0) / (ee.mRideTime / 1000.0 / 3600.0);
+          displaySet (F("avgSpeed"), avgSpeed, 0, F("km/h"));
+
+          displaySet (F("km"), ee.mDistance / 1000.0, 1, F("km"));
+
+          displaySet (F("kmSinceCharge"), ee.mDistanceLastCharge / 1000.0, 1, F("km"));
+
+          displaySet (F("totalKm"), wd.mTotalDistance / 1000.0, 0, F("km"));
+
+          displaySet (F("maxPower"), ee.mMaxPower, 0, F("W"));
+
+          displaySet (F("maxChargePower"), ee.mMaxChargePower, 0, F("W"));
+
+          displaySet (F("rideTime"), timeToString (ee.mRideTime / 1000UL));
+
+          displaySet (F("totalRuntime"), timeToString (ee.mTotalRuntime / 1000UL));
+
+          break;
         }
+        case NEXTION_PAGE_ERRORS : {
+          if (lastDisplayedPage != displayedPage) {
+            uint16_t y = 35;
+            uint8_t i;
+            if (bms.mErrors) {
+              for (i = 0; i < BMS_ERRORS_SIZE; i++) {
+                if (bms.mErrors & (1 << i)) {
+                  display.print(F("xstr 2,"));
+                  display.print(y);
+                  display.print(F(",396,25,0,RED,BLACK,0,1,3,\"BMS: "));
+                  display.print(BMS_ERRORS[i]);
+                  display.print("\"");
+                  displayCommit();
+                  y += 25;
+                }
+              }
+            }
 
-        displaySet (F("avgSpeed"), avgSpeed, 0, F("km/h"));
-
-        displaySet (F("km"), ee.mDistance / 1000.0, 1, F("km"));
-
-        displaySet (F("kmSinceCharge"), ee.mDistanceLastCharge / 1000.0, 1, F("km"));
-
-        displaySet (F("totalKm"), wd.mTotalDistance / 1000.0, 0, F("km"));
-
-        displaySet (F("maxPower"), ee.mMaxPower, 0, F("W"));
-
-        displaySet (F("maxChargePower"), ee.mMaxChargePower, 0, F("W"));
-
-        displaySet (F("rideTime"), timeToString (ee.mRideTime / 1000UL));
-
-        displaySet (F("totalRuntime"), timeToString (ee.mTotalRuntime / 1000UL));
-
-        break;
-      }
-      case NEXTION_PAGE_ERRORS : {
-        if (lastDisplayedPage != displayedPage) {
-          uint16_t y = 35;
-          uint8_t i;
-          if (bms.mErrors) {
-            for (i = 0; i < BMS_ERRORS_SIZE; i++) {
-              if (bms.mErrors & (1 << i)) {
-                display.print(F("xstr 2,"));
-                display.print(y);
-                display.print(F(",396,25,0,RED,BLACK,0,1,3,\"BMS: "));
-                display.print(BMS_ERRORS[i]);
-                display.print("\"");
-                displayCommit();
-                y += 25;
+            if (wd.mErrors) {
+              for (i = 0; i < EUC_ERRORS_SIZE; i++) {
+                if (wd.mErrors & (1 << i)) {
+                  display.print(F("xstr 2,"));
+                  display.print(y);
+                  display.print(F(",396,25,0,RED,BLACK,0,1,3,\"EUC: "));
+                  display.print(EUC_ERRORS[i]);
+                  display.print("\"");
+                  displayCommit();
+                  y += 25;
+                }
               }
             }
           }
 
-          if (wd.mErrors) {
-            for (i = 0; i < EUC_ERRORS_SIZE; i++) {
-              if (wd.mErrors & (1 << i)) {
-                display.print(F("xstr 2,"));
-                display.print(y);
-                display.print(F(",396,25,0,RED,BLACK,0,1,3,\"EUC: "));
-                display.print(EUC_ERRORS[i]);
-                display.print("\"");
-                displayCommit();
-                y += 25;
-              }
-            }
-          }
+          break;
         }
+        case NEXTION_PAGE_GPS : {
+          float flat, flon;
+          unsigned long age; // ms
 
-        break;
+          gps.f_get_position(&flat, &flon, &age);
+
+          display.print(F("gpsLoc.txt=\""));
+          if ((age < GPS_MAX_AGE) && (flat != TinyGPS::GPS_INVALID_F_ANGLE) && (flon != TinyGPS::GPS_INVALID_F_ANGLE)) {
+            display.printf ("%.6fN %.6fE", flat, flon);
+          } else {
+            display.print (F("???"));
+          }
+          display.print ('"');
+          displayCommit();
+
+          displaySet (F("gpsAlt"), gps.f_altitude(), 0, F("m"));
+
+          displaySet (F("gpsSat"), String(gps.satellites()));
+
+          displaySet(F("gpsAge"), age / 1000.0, 0, F("sec."));
+
+          displaySet(F("gpsHdop"), String(gps.hdop()));
+
+          unsigned long chars;
+          unsigned short good_sentences;
+          unsigned short failed_cs;
+           
+          gps.stats(&chars, &good_sentences, &failed_cs);
+
+          Serial.printf ("characters: %llu, sentences: %u, failed_cs: %u\r\n", chars, good_sentences, failed_cs);
+
+          break;
+        }
+        default:
+          break;
       }
-      default:
-        break;
+
+      lastDisplayedPage = displayedPage;
     }
-
-    lastDisplayedPage = displayedPage;
 
     // If it stopped (and traveled more than ${MIN_DISTANCE_TO_SAVE_EEPROM} meters), then the trip is saved.
     if (wd.mSpeed == 0) {
@@ -1089,7 +1153,6 @@ void loop() {
     }
 
     // Riding time update.
-    unsigned long now = millis();
     if (wd.mSpeed > 0) {
       if (lastRideTime > 0UL) {
         ee.mRideTime += (now - lastRideTime);
@@ -1121,7 +1184,11 @@ void loop() {
     reboot (F("Max BMS packet time reached. Rebooting..."));
   }
 
-  delay(DISPLAY_UPDATE);
+  while (gpsSerial.available()) {
+    gps.encode (gpsSerial.read());
+  }
+
+  yield();
 }
 
 /*
@@ -1129,8 +1196,24 @@ void loop() {
 */
 void writeDataToLog (DateTime time) {
   char logLine [1024];
-  // HH:MM:SS;speed;euc_temp;euc_dist_since_charge;euc_phase_current;bms_voltage;bms_current;battery_level;bms_temp;bat1_temp;bat2_temp;bms_balance_cur;
-  sprintf (logLine, "%02d:%02d:%02d;%d;%ld;%ld;%.1f;%.1f;%.1f;%.0f;%.0f;%.0f;%.0f;%.3f;",
+  float flat, flon, falt;
+  unsigned long age, hdop;
+  unsigned short satellites;
+
+  gps.f_get_position(&flat, &flon, &age);
+  falt = gps.f_altitude();
+  satellites = gps.satellites();
+  hdop = gps.hdop();
+
+  if ((age > GPS_MAX_AGE) || (hdop == TinyGPS::GPS_INVALID_HDOP) || (flat == TinyGPS::GPS_INVALID_F_ANGLE) || (flon == TinyGPS::GPS_INVALID_F_ANGLE)) {
+    flat = -1;
+    flon = -1;
+    falt = -1;
+    satellites = 0;
+  }
+
+  // HH:MM:SS;speed;euc_temp;euc_dist_since_charge;euc_phase_current;bms_voltage;bms_current;battery_level;bms_temp;bat1_temp;bat2_temp;bms_balance_cur;gps_lat;gps_lon;gps_alt;gps_satellites;hdop;
+  sprintf (logLine, "%02d:%02d:%02d;%d;%d;%d;%.1f;%.1f;%.1f;%.0f;%.0f;%.0f;%.0f;%.3f;%.6f;%.6f;%.0f;%d;%llu;",
     time.hour(),
     time.minute(),
     time.second(),
@@ -1144,7 +1227,9 @@ void writeDataToLog (DateTime time) {
     bms.mBmsTemperature,
     bms.mTemperature1,
     bms.mTemperature2,
-    bms.mBalancingCurrent
+    bms.mBalancingCurrent,
+    flat, flon, falt,
+    satellites, hdop
   );
 
   SD_write_log (time, logLine);
@@ -1352,14 +1437,13 @@ void serialTunnel() {
   switchPage (NEXTION_PAGE_TUNNEL);
   delay(1000);
 
-  SD_command_mode();
   while (true) {
     if (Serial.available()) {
-      Serial1.write(Serial.read());
+      display.write(Serial.read());
     }
 
-    if (Serial1.available()) {
-      Serial.write(Serial1.read());
+    if (display.available()) {
+      Serial.write(display.read());
     }
   }
 }

@@ -166,7 +166,7 @@ void SD_setup(void) {
 
     char* needle = strstr (diskInfo, "Card Size:");
     if (needle) {
-      if (sscanf (needle, "Card Size: %u KB", &disk_size) == 1) {
+      if (sscanf (needle, "Card Size: %llu KB", &disk_size) == 1) {
         disk_size *= (1024 * 1024);
       }
     }
@@ -214,7 +214,6 @@ void SD_loop_wifi(void) {
 
 bool save_current_log_fragment (DateTime time) {
   char file_name [20];
-  char payload [32];
 
   sprintf (file_name, "/%04d%02d%02d.idx", time.year(), time.month(), time.day());
   if (OL_send_command("rm " + String(file_name)) && OL_send_command ("append " + String(file_name), OPENLOG_OUTPUT_PROMPT)) {
@@ -386,7 +385,6 @@ void SD_info(uint64_t* used_by_files, uint64_t* free, int* count_files) {
   char file_name [20];
   unsigned int file_size;
   off_t pos = 0;
-  uint64_t file_space = 0;
 
   (* used_by_files) = 0;
   (* free) = 0;
@@ -611,7 +609,6 @@ off_t transfer_file_from_sd_card (String filename) {
   char buffer [OPENLOG_TRANSFER_BUFF_SIZE * 3 + 20];
   off_t pos = 0;
   char payload [32];
-  int file_size;
 
   displaySetStatus ("Transfering file " + filename + " ...");
 
@@ -699,8 +696,6 @@ off_t transfer_file_from_sd_card (String filename) {
 
 //Download a file from the SD, it is called in void SD_dir()
 void SD_file_download (String filename, String content_disposition) {
-  unsigned long t;
-  char c;
   int file_size;
   size_t total_size = 0;
   char payload [256];
@@ -713,7 +708,6 @@ void SD_file_download (String filename, String content_disposition) {
   if (filename.endsWith(".idx")) {
     // Day metrics
     String date_part = filename.substring(0, 8);
-    char file_name [32];
 
     server.sendHeader ("Content-Disposition", content_disposition + "; filename=" + date_part + String(".csv"));
 

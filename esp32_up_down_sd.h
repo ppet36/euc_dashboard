@@ -24,7 +24,6 @@ void SendHTML_Header();
 void SendHTML_Content();
 void SendHTML_Stop();
 void ReportSDNotPresent();
-void ReportFileNotPresent(String target);
 void ReportCouldNotCreateFile(String target);
 String SD_file_size(uint64_t bytes);
 void append_page_header();
