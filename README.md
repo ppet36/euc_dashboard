@@ -18,6 +18,6 @@ I added support for RTC (DS3231) and SD card metadata logging via OpenLOG. You c
 ## Update 2024-04-25
 I added the Neo6M GPS module + coordinate and altitude logging to the metadata. Current view inside:
 
-![alt](/images/dash_int_current.jpg?raw=true)
+![alt](/images/dash_int_current.jpeg?raw=true)
 
 
