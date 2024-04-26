@@ -1110,34 +1110,64 @@ void loop() {
           break;
         }
         case NEXTION_PAGE_GPS : {
-          float flat, flon;
+          float flat, flon, altitude;
           unsigned long age, hdop; // ms
+          unsigned short satellites;
+
 
           gps.f_get_position(&flat, &flon, &age);
           hdop = gps.hdop();
+          satellites = gps.satellites();
+          altitude = gps.f_altitude();
 
           display.print(F("gpsLoc.txt=\""));
           if ((age < GPS_MAX_AGE) && (flat != TinyGPS::GPS_INVALID_F_ANGLE) && (flon != TinyGPS::GPS_INVALID_F_ANGLE)) {
             display.printf ("%.6fN %.6fE", flat, flon);
           } else {
-            display.print (F("???"));
+            display.print ('-');
           }
           display.print ('"');
           displayCommit();
 
-          displaySet (F("gpsAlt"), gps.f_altitude(), 0, F("m"));
+          display.print (F("gpsAlt.txt=\""));
+          if (altitude == TinyGPS::GPS_INVALID_F_ALTITUDE) {
+            display.print ('-');
+          } else {
+            display.printf ("%.0fm", altitude);
+          }
+          display.print ('"');
+          displayCommit();
 
-          displaySet (F("gpsSat"), String(gps.satellites()));
+          displaySet (F("gpsSat"), (satellites == TinyGPS::GPS_INVALID_SATELLITES) ? "-" : String(satellites));
 
-          displaySet(F("gpsAge"), age / 1000.0, 0, F("sec."));
+          display.print (F("gpsAge.txt=\""));
+          if (age == TinyGPS::GPS_INVALID_AGE) {
+            display.print (F("not fixed"));
+          } else {
+            display.printf ("%.0fsec.", age / 1000.0);
+          }
+          display.print ('"');
+          displayCommit();
 
-          displaySet(F("gpsHdop"), (hdop == TinyGPS::GPS_INVALID_HDOP) ? "-" : String(hdop));
+          display.print (F("gpsHdop.txt=\""));
+          if (hdop == TinyGPS::GPS_INVALID_HDOP) {
+            display.print ('-');
+          } else {
+            display.printf ("%.1f", hdop / 100.0);
+          }
+          display.print ('"');
+          displayCommit();
 
           unsigned long chars;
           unsigned short good_sentences;
           unsigned short failed_cs;
            
           gps.stats(&chars, &good_sentences, &failed_cs);
+
+          display.print (F("gpsInfo.txt=\""));
+          display.printf ("Chars: %lu, Sentences: %u, Failed: %u", chars, good_sentences, failed_cs);
+          display.print ('"');
+          displayCommit();
 
           Serial.printf ("characters: %lu, sentences: %u, failed_cs: %u\r\n", chars, good_sentences, failed_cs);
 
