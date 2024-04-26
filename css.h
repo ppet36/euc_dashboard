@@ -7,7 +7,7 @@
 #define __CSS_H__
 
 // WiFi AP
-#define servername "eucserver"
+#define SERVERNAME "eucserver"
 #define WIFI_SSID "ppet36_euc"
 #define WIFI_PASSWORD "wifippet36euc"
 

@@ -14,6 +14,8 @@
 #include <DS3231.h>
 #include <SoftwareSerial.h>
 #include <TinyGPS.h>
+#include <ArduinoOTA.h>
+#include "css.h"
 #include "esp32_up_down_sd.h"
 
 // Frequency of display update.
@@ -1109,9 +1111,10 @@ void loop() {
         }
         case NEXTION_PAGE_GPS : {
           float flat, flon;
-          unsigned long age; // ms
+          unsigned long age, hdop; // ms
 
           gps.f_get_position(&flat, &flon, &age);
+          hdop = gps.hdop();
 
           display.print(F("gpsLoc.txt=\""));
           if ((age < GPS_MAX_AGE) && (flat != TinyGPS::GPS_INVALID_F_ANGLE) && (flon != TinyGPS::GPS_INVALID_F_ANGLE)) {
@@ -1128,7 +1131,7 @@ void loop() {
 
           displaySet(F("gpsAge"), age / 1000.0, 0, F("sec."));
 
-          displaySet(F("gpsHdop"), String(gps.hdop()));
+          displaySet(F("gpsHdop"), (hdop == TinyGPS::GPS_INVALID_HDOP) ? "-" : String(hdop));
 
           unsigned long chars;
           unsigned short good_sentences;
@@ -1136,7 +1139,7 @@ void loop() {
            
           gps.stats(&chars, &good_sentences, &failed_cs);
 
-          Serial.printf ("characters: %llu, sentences: %u, failed_cs: %u\r\n", chars, good_sentences, failed_cs);
+          Serial.printf ("characters: %lu, sentences: %u, failed_cs: %u\r\n", chars, good_sentences, failed_cs);
 
           break;
         }
@@ -1210,10 +1213,11 @@ void writeDataToLog (DateTime time) {
     flon = -1;
     falt = -1;
     satellites = 0;
+    hdop = 0;
   }
 
   // HH:MM:SS;speed;euc_temp;euc_dist_since_charge;euc_phase_current;bms_voltage;bms_current;battery_level;bms_temp;bat1_temp;bat2_temp;bms_balance_cur;gps_lat;gps_lon;gps_alt;gps_satellites;hdop;
-  sprintf (logLine, "%02d:%02d:%02d;%d;%d;%d;%.1f;%.1f;%.1f;%.0f;%.0f;%.0f;%.0f;%.3f;%.6f;%.6f;%.0f;%d;%llu;",
+  sprintf (logLine, "%02d:%02d:%02d;%d;%d;%d;%.1f;%.1f;%.1f;%.0f;%.0f;%.0f;%.0f;%.3f;%.6f;%.6f;%.0f;%d;%lu;",
     time.hour(),
     time.minute(),
     time.second(),
@@ -1466,9 +1470,14 @@ void wifiAp() {
   SD_setup_wifi();
   delay(1000);
 
+  ArduinoOTA.setHostname(SERVERNAME);
+  ArduinoOTA.setPassword(WIFI_PASSWORD);
+  ArduinoOTA.begin();
+
   switchPage(NEXTION_PAGE_WIFI);
 
   while (true) {
+    ArduinoOTA.handle();
     SD_loop_wifi();
   }
 }

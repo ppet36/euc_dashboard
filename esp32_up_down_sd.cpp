@@ -66,7 +66,7 @@ uint16_t current_log_fragment_index = 1;
 String webpage;
 
 // HH:MM:SS;speed;euc_temp;euc_dist_since_charge;euc_phase_current;bms_voltage;bms_current;battery_level;bms_temp;bat1_temp;bat2_temp;bms_balance_cur;
-const char CSV_HEADERS[] PROGMEM = "Time;Speed;EUC temp;EUC dist. since charge;EUC phase current;BMS voltage;BMS current;Battery level;BMS temp;Battery temp1;Battery temp2;BMS ballance current;";
+const char CSV_HEADERS[] PROGMEM = "Time;Speed;EUC temp;EUC dist. since charge;EUC phase current;BMS voltage;BMS current;Battery level;BMS temp;Battery temp1;Battery temp2;BMS ballance current;Latitude;Longitude;Altitude;Satellites;Hdop;";
 
 
 // External logging function which prints to serial and display.
@@ -189,7 +189,7 @@ void SD_setup_wifi(void) {
   WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
   
   //Set your preferred server name, if you use "mcserver" the address would be http://mcserver.local/
-  if (!MDNS.begin(servername)) {          
+  if (!MDNS.begin(SERVERNAME)) {          
     logLine(F("Error setting up MDNS responder!"));
     delay (1000);
     ESP.restart(); 
