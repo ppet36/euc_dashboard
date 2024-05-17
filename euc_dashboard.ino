@@ -15,6 +15,7 @@
 #include <SoftwareSerial.h>
 #include <TinyGPS.h>
 #include <ArduinoOTA.h>
+#include "RunningMedian.h"
 #include "css.h"
 #include "esp32_up_down_sd.h"
 
@@ -23,6 +24,10 @@
 
 // SD update
 #define SD_UPDATE_TIME 1000
+
+// Light update time
+#define LIGHT_UPDATE_TIME 1000
+#define LIGHT_LEVEL_INCREMENT 50
 
 // Time in milliseconds when a packet must be sent from EUC/BMS otherwise it is taken as
 // lose connection and reboot.
@@ -60,6 +65,7 @@
 #define NEXTION_PAGE_WIFI 9
 #define NEXTION_PAGE_SETTIME 10
 #define NEXTION_PAGE_GPS 11
+#define NEXTION_PAGE_LIGHT 12
 
 // Image indexes
 #define NEXTION_II_LIGHT_OFF 9
@@ -75,7 +81,7 @@
 #define GW_PEDALS_MODE_SOFT 0
 #define GW_SPEED_INCREMENT 3
 
-#define EUC_MAX_POWER 10000
+#define EUC_MAX_POWER 5000
 #define EUC_MAX_CHG_POWER 2500
 
 // The minimum distance in meters when a trip is written to the EEPROM when stopping
@@ -92,6 +98,9 @@
 #define GPS_RX 32
 #define GPS_TX 33
 #define GPS_MAX_AGE 15000UL // 15s
+
+// Light
+#define PIN_LIGHT_INTENSITY 35
 
 // BLE services; they are the same for BMS and EUC, however, in principle, they are declared separately.
 static BLEUUID serviceUUID_EUC("0000ffe0-0000-1000-8000-00805f9b34fb");
@@ -138,7 +147,9 @@ struct EepromData {
   uint64_t mRideTime;
   float mLastBatteryPercentRemaining;
   uint32_t mDistanceLastCharge;
-  uint64_t mTotalRuntime; 
+  uint64_t mTotalRuntime;
+  uint16_t mLightLevelOff;
+  uint16_t mLightLevelOn;
 } ee;
 
 // Data structure from EUC
@@ -244,10 +255,17 @@ unsigned long lastRideTime = 0UL;
 unsigned long lastTotalRuntimeTime = 0UL;
 // Last write to SD card
 unsigned long lastSDWrite = 0UL;
+// Last light intensity update
+unsigned long lastLightUpdate = 0UL;
 
 // GPS
 SoftwareSerial gpsSerial (GPS_RX, GPS_TX);
 TinyGPS gps;
+
+// Light
+RunningMedian<uint16_t,30> lightLevel;
+// - automatic light is turned off when any manual light operation is performed
+bool autoLight = true;
 
 // BMS errors
 #define BMS_ERRORS_SIZE 16
@@ -476,6 +494,8 @@ void setup() {
     ee.mLastBatteryPercentRemaining = -1;
     ee.mDistanceLastCharge = 0;
     ee.mTotalRuntime = 0;
+    ee.mLightLevelOff = 4095;
+    ee.mLightLevelOn = 0;
   }
 
   // Scan devices
@@ -690,13 +710,24 @@ void rtcSetTime() {
   rtc.setSecond (setTimeStruct.second);
 }
 
+// Updates auto light
+void updateAutoLight() {
+  EEPROM.put (0, ee);
+  EEPROM.commit();
+}
+
+
 // Handles display events.
 void handleDisplay() {
   while (display.available() > 0) {
     uint8_t val = display.read();
     switch (val) {
       case 'L':
+        autoLight = false;
         toggleLight();
+        break;
+      case 'l':
+        switchPage (NEXTION_PAGE_LIGHT);
         break;
       case 'D':
         serialTunnel();
@@ -791,6 +822,12 @@ void handleDisplay() {
         } else if (displayedPage == NEXTION_PAGE_SETTIME) {
           addCurrentSetTime (1);
           updateSetTimeForm();
+        } else if (displayedPage == NEXTION_PAGE_LIGHT) {
+          ee.mLightLevelOn += LIGHT_LEVEL_INCREMENT;
+          if (ee.mLightLevelOn > 4095) {
+            ee.mLightLevelOn = 4095;
+          }
+          updateAutoLight();
         }
         break;
       case '-':
@@ -800,9 +837,40 @@ void handleDisplay() {
         } else if (displayedPage == NEXTION_PAGE_SETTIME) {
           addCurrentSetTime (-1);
           updateSetTimeForm();
+        } else if (displayedPage == NEXTION_PAGE_LIGHT) {
+          if (ee.mLightLevelOn < LIGHT_LEVEL_INCREMENT) {
+            ee.mLightLevelOn = 0;
+          } else {
+            ee.mLightLevelOn -= LIGHT_LEVEL_INCREMENT;
+          }
+          updateAutoLight();
         }
         break;
-
+      case '*':
+        ee.mLightLevelOff += LIGHT_LEVEL_INCREMENT;
+        if (ee.mLightLevelOff > 4095) {
+          ee.mLightLevelOff = 4095;
+        }
+        updateAutoLight();
+        break;
+      case '/':
+        if (ee.mLightLevelOff < LIGHT_LEVEL_INCREMENT) {
+          ee.mLightLevelOff = 0;
+        } else {
+          ee.mLightLevelOff -= LIGHT_LEVEL_INCREMENT;
+        }
+        updateAutoLight();
+        break;
+      case ',':
+        if (!lightLevel.getMedian (ee.mLightLevelOn)) {
+          updateAutoLight();
+        }
+        break;
+      case '.':
+        if (!lightLevel.getMedian (ee.mLightLevelOff)) {
+          updateAutoLight();
+        }
+        break;
       case 'S':
         switchPage (NEXTION_PAGE_SETTINGS);
         break;
@@ -1173,6 +1241,19 @@ void loop() {
 
           break;
         }
+        case NEXTION_PAGE_LIGHT : {
+          uint16_t median;
+          if (!lightLevel.getMedian(median)) {
+            display.print ("lCurrent.txt=\"Current median is ");
+            display.print (median);
+            display.print (".\"");
+            displayCommit();
+          }
+
+          displaySet (F("lOffLevel"), String(ee.mLightLevelOff));
+          displaySet (F("lOnLevel"), String(ee.mLightLevelOn));
+          break;
+        }
         default:
           break;
       }
@@ -1204,6 +1285,21 @@ void loop() {
     if ((displayedPage == NEXTION_PAGE_MAIN) && SD_initialized() && hasRtc && ((now - lastSDWrite) > SD_UPDATE_TIME)) {
       writeDataToLog (currentTime);
       lastSDWrite = now;
+    }
+
+    if ((now - lastLightUpdate) > LIGHT_UPDATE_TIME) {
+      lightLevel.add(analogRead(PIN_LIGHT_INTENSITY));
+
+      uint16_t lightLevelMedian, lightLevelMin;
+      if (autoLight && !lightLevel.getMedian(lightLevelMedian) && !lightLevel.getLowest(lightLevelMin)) {
+        if (lightLevelMedian > ee.mLightLevelOff) {
+          turnLightOff();
+        } else if (lightLevelMin < ee.mLightLevelOn) {
+          turnLightOn();
+        }
+      }
+
+      lastLightUpdate = now;
     }
   }
 
@@ -1422,11 +1518,23 @@ void reboot(String cause) {
 void toggleLight() {
   Serial.println(F("Toggle light"));
   if (wd.mLightMode == 0) {
-    pRemoteEucCharacteristic->writeValue((uint8_t)'Q');
+    turnLightOn();
   } else {
-    pRemoteEucCharacteristic->writeValue((uint8_t)'E');
+    turnLightOff();
   }
 }
+
+void turnLightOn() {
+  if (wd.mLightMode == 0) {
+    pRemoteEucCharacteristic->writeValue((uint8_t)'Q');
+  }
+}
+
+void turnLightOff() {
+  if (wd.mLightMode > 0) {
+    pRemoteEucCharacteristic->writeValue((uint8_t)'E');
+  }
+} 
 
 // Updates pedal mode
 void updatePedalsMode() {
