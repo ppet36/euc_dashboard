@@ -1242,11 +1242,13 @@ void loop() {
           break;
         }
         case NEXTION_PAGE_LIGHT : {
-          uint16_t median;
-          if (!lightLevel.getMedian(median)) {
-            display.print ("lCurrent.txt=\"Current median is ");
+          uint16_t median, lowest;
+          if (!lightLevel.getMedian(median) && !lightLevel.getLowest(lowest)) {
+            display.print ("lCurrent.txt=\"Med: ");
             display.print (median);
-            display.print (".\"");
+            display.print (", Low: ");
+            display.print (lowest);
+            display.print ('"');
             displayCommit();
           }
 
@@ -1292,11 +1294,11 @@ void loop() {
 
       uint16_t lightLevelMedian, lightLevelMin;
       if (autoLight && !lightLevel.getMedian(lightLevelMedian) && !lightLevel.getLowest(lightLevelMin)) {
-        if (lightLevelMedian > ee.mLightLevelOff) {
-          turnLightOff();
-        } else if (lightLevelMin < ee.mLightLevelOn) {
+        if (lightLevelMin < ee.mLightLevelOn) {
           turnLightOn();
-        }
+        } else if (lightLevelMedian > ee.mLightLevelOff) {
+          turnLightOff();
+        } 
       }
 
       lastLightUpdate = now;
