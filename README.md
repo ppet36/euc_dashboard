@@ -22,7 +22,3 @@ I added the Neo6M GPS module + coordinate and altitude logging to the metadata. 
 
 ## Update 2024-05-17
 I added a PGM5639D photoresistor to pin 35 of the ESP32 with a 100K resistor to ground to measure the light intensity + auto light on/off on the EUC.
-
-## Update 2024-05-17
-I added a PGM5639D photoresistor to pin 35 of the ESP32 with a 100K resistor to ground to measure the light intensity + auto light on/off on the EUC.
-
